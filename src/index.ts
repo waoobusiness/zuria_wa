@@ -6,7 +6,6 @@
 import Fastify from 'fastify'
 import fastifyStatic from '@fastify/static'
 import cors from '@fastify/cors'
-import fastifyStatic from '@fastify/static'
 import QRCode from 'qrcode'
 import { v4 as uuid } from 'uuid'
 
