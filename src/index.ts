@@ -214,4 +214,4 @@ app.post('/messages', async (req, reply) => {
 /** Healthcheck */
 app.get('/health', async (_req, reply) => reply.send({ ok: true }))
 
-app.listen({ port: PORT, host: '0.0.0.0' })
+await app.listen({ port: PORT, host: '0.0.0.0' })
