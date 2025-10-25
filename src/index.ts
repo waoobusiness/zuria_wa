@@ -327,6 +327,38 @@ async function startSession(id: string) {
   return s
 }
 
+// ---------- Logout de la session ----------
+async function destroySession(id: string) {
+  const s = sessions.get(id)
+  if (!s) {
+    return
+  }
+
+  app.log.warn({ msg: 'destroying session (logout requested)', id })
+
+  // 1. Déconnexion côté WhatsApp
+  try {
+    await s.sock?.logout()
+  } catch (e) {
+    app.log.error({ msg: 'logout error', id, err: String(e) })
+  }
+
+  // 2. On ferme proprement le socket
+  try { (s.sock as any)?.ev?.removeAllListeners?.() } catch {}
+  try { (s.sock as any)?.ws?.close?.() } catch {}
+
+  // 3. On supprime les creds sur le disque
+  try {
+    fs.rmSync(path.join(AUTH_DIR, id), { recursive: true, force: true })
+  } catch (e) {
+    app.log.error({ msg: 'failed to remove auth dir', id, err: String(e) })
+  }
+
+  // 4. On enlève la session de la mémoire
+  sessions.delete(id)
+}
+
+
 
 // ---------- API ROUTES ----------
 
@@ -489,6 +521,20 @@ app.get('/send', async (_req, reply) => {
 
 // 7. healthcheck Render
 app.get('/health', async (_req, reply) => reply.send({ ok: true }))
+
+// Déconnecter / supprimer complètement une session WhatsApp
+app.post('/sessions/:id/logout', async (req, reply) => {
+  const id = (req.params as any).id
+  const s = sessions.get(id)
+  if (!s) {
+    return reply.code(404).send({ error: 'unknown session' })
+  }
+
+  await destroySession(id)
+
+  return reply.send({ ok: true, message: 'session destroyed' })
+})
+
 
 
 // ---------- START SERVER ----------
