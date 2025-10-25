@@ -208,30 +208,49 @@ app.get('/send', async (_req, reply) => {
   <html><head><meta charset="utf-8"><title>Envoyer un message</title></head>
   <body style="font-family: system-ui; max-width: 700px; margin: 40px auto;">
     <h2>Envoyer un message WhatsApp</h2>
+
     <label>ID de session<br/>
-      <input id="sid" style="width:100%" placeholder="colle ici l'ID de session"/>
+      <input id="sid" style="width:100%" value="9b115dd2-28e1-49d5-ba30-5176a9ea5408"/>
     </label>
-    <br/><br/>
+    <div style="margin:8px 0">
+      <button id="check">Vérifier statut</button>
+      <button id="restart">Relancer</button>
+    </div>
+
     <label>Numéro (ex: 41766085008)<br/>
-      <input id="to" style="width:100%" placeholder="chiffres uniquement, sans + ni espaces"/>
+      <input id="to" style="width:100%" placeholder="chiffres uniquement"/>
     </label>
     <br/><br/>
     <label>Message<br/>
-      <textarea id="text" style="width:100%; height:120px" placeholder="Ton message..."></textarea>
+      <textarea id="text" style="width:100%; height:120px">Hello depuis Zuria 🚀</textarea>
     </label>
     <br/><br/>
     <button id="btn">Envoyer</button>
+
     <pre id="out" style="background:#111;color:#0f0;padding:12px;margin-top:16px;white-space:pre-wrap;"></pre>
 
     <script>
+      const out = document.getElementById('out')
+
+      document.getElementById('check').onclick = async () => {
+        const sid = document.getElementById('sid').value.trim()
+        const r = await fetch('/sessions/' + sid)
+        const j = await r.json()
+        out.textContent = JSON.stringify(j, null, 2)
+      }
+
+      document.getElementById('restart').onclick = async () => {
+        const sid = document.getElementById('sid').value.trim()
+        const r = await fetch('/sessions/' + sid + '/restart', { method: 'POST' })
+        const j = await r.json()
+        out.textContent = JSON.stringify(j, null, 2)
+      }
+
       document.getElementById('btn').onclick = async () => {
         const sessionId = document.getElementById('sid').value.trim()
         const to = document.getElementById('to').value.trim()
         const text = document.getElementById('text').value
-
-        const out = document.getElementById('out')
         out.textContent = 'Envoi en cours...'
-
         try {
           const r = await fetch('/messages', {
             method:'POST',
@@ -248,6 +267,7 @@ app.get('/send', async (_req, reply) => {
   </body></html>`
   reply.type('text/html').send(html)
 })
+
 // --- fin mini console ---
 
 
