@@ -312,25 +312,52 @@ async function startSession(id: string) {
   // listeners
   sock.ev.on('creds.update', saveCreds)
 
+    // 2. Messages entrants / sortants
   sock.ev.on('messages.upsert', async (m) => {
+    // m.type === 'notify' => nouveaux messages (pas l'historique complet)
+    if (m.type !== 'notify') return
+
     const msg = m.messages?.[0]
     if (!msg || !msg.key?.remoteJid) return
 
-    const remoteJid = msg.key.remoteJid
+    // le chat (la conversation)
+    const chatJid = msg.key.remoteJid            // ex: "41766085008@s.whatsapp.net"
+    const chatNumber = extractPhoneFromJid(chatJid) // ex: "41766085008" (notre helper)
+
+    // texte du message
     const text =
       msg.message?.conversation
       || msg.message?.extendedTextMessage?.text
       || msg.message?.imageMessage?.caption
       || ''
 
-    app.log.info({ inbound: { sessionId: s.id, from: remoteJid, text } })
+    // est-ce que CE message a été envoyé par NOUS (depuis ce compte WhatsApp) ?
+    const fromMe = msg.key.fromMe === true
 
-    // webhook -> Zuria
-    await pushWebhookEvent(s, 'message.in', {
-      from: remoteJid,
-      text
+    app.log.info({
+      inbound: {
+        sessionId: s.id,
+        chatJid,
+        chatNumber,
+        text,
+        fromMe
+      }
+    })
+
+    // 🔥 on envoie maintenant chatNumber proprement
+    await sendWebhookEvent(s, {
+      sessionId: s.id,
+      event: fromMe ? 'message.out' : 'message.in',
+      data: {
+        chatJid,      // ex: "41766085008@s.whatsapp.net"
+        chatNumber,   // ex: "41766085008"  <-- à utiliser pour afficher dans l'UI
+        text,
+        fromMe        // true si envoyé par nous, false si reçu du client
+      },
+      ts: Date.now()
     })
   })
+
 
   sock.ev.on('connection.update', async (u) => onConnectionUpdate(s, u))
 
