@@ -202,6 +202,55 @@ app.post('/messages', async (req, reply) => {
 
 app.get('/health', async (_req, reply) => reply.send({ ok: true }))
 
+// --- Mini console d’envoi de message ---
+app.get('/send', async (_req, reply) => {
+  const html = `
+  <html><head><meta charset="utf-8"><title>Envoyer un message</title></head>
+  <body style="font-family: system-ui; max-width: 700px; margin: 40px auto;">
+    <h2>Envoyer un message WhatsApp</h2>
+    <label>ID de session<br/>
+      <input id="sid" style="width:100%" placeholder="colle ici l'ID de session"/>
+    </label>
+    <br/><br/>
+    <label>Numéro (ex: 41766085008)<br/>
+      <input id="to" style="width:100%" placeholder="chiffres uniquement, sans + ni espaces"/>
+    </label>
+    <br/><br/>
+    <label>Message<br/>
+      <textarea id="text" style="width:100%; height:120px" placeholder="Ton message..."></textarea>
+    </label>
+    <br/><br/>
+    <button id="btn">Envoyer</button>
+    <pre id="out" style="background:#111;color:#0f0;padding:12px;margin-top:16px;white-space:pre-wrap;"></pre>
+
+    <script>
+      document.getElementById('btn').onclick = async () => {
+        const sessionId = document.getElementById('sid').value.trim()
+        const to = document.getElementById('to').value.trim()
+        const text = document.getElementById('text').value
+
+        const out = document.getElementById('out')
+        out.textContent = 'Envoi en cours...'
+
+        try {
+          const r = await fetch('/messages', {
+            method:'POST',
+            headers:{ 'Content-Type':'application/json' },
+            body: JSON.stringify({ sessionId, to, text })
+          })
+          const j = await r.json()
+          out.textContent = JSON.stringify(j, null, 2)
+        } catch (e) {
+          out.textContent = 'Erreur: ' + e
+        }
+      }
+    </script>
+  </body></html>`
+  reply.type('text/html').send(html)
+})
+// --- fin mini console ---
+
+
 app.listen({ port: PORT, host: '0.0.0.0' }).then(() => {
   app.log.info(`HTTP server listening on ${PORT}`)
 })
