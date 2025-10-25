@@ -4,6 +4,7 @@
 // IMPORTS
 // -------------------------
 import Fastify from 'fastify'
+import fastifyStatic from '@fastify/static'
 import cors from '@fastify/cors'
 import fastifyStatic from '@fastify/static'
 import QRCode from 'qrcode'
