@@ -58,6 +58,39 @@ app.get('/', async (_req, reply) => {
   </body></html>`
   reply.type('text/html').send(html)
 })
+async function restartSession(id: string) {
+  const s = sessions.get(id)
+  if (!s) return
+
+  app.log.warn({ msg: 'restart WA session (515)', id })
+
+  // Nettoyage "soft" de l'ancien socket
+  try { (s.sock as any)?.ev?.removeAllListeners?.() } catch {}
+  try { (s.sock as any)?.ws?.close?.() } catch {}
+  s.sock = undefined
+  s.connected = false
+  s.qr = null
+  s.qr_text = null
+
+  // Recrée un nouveau socket avec le même répertoire d’auth
+  const { state, saveCreds } = await useMultiFileAuthState(path.join(AUTH_DIR, id))
+  const { version } = await fetchLatestBaileysVersion()
+
+  s.saveCreds = saveCreds
+  const sock = makeWASocket({
+    version,
+    auth: state,
+    printQRInTerminal: false,
+    browser: ['Zuria', 'Chrome', '120.0.0.0'],
+    connectTimeoutMs: 60_000,
+    defaultQueryTimeoutMs: 60_000
+  })
+  s.sock = sock
+
+  // Rebranche tous les listeners (même logique que dans startSession)
+  sock.ev.on('creds.update', saveCreds)
+  sock.ev.on('connection.update', async (u) => onConnectionUpdate(s, u))
+}
 
 async function startSession(id: string) {
   fs.mkdirSync(path.join(AUTH_DIR, id), { recursive: true })
