@@ -159,6 +159,38 @@ async function startSession(id: string) {
   sessions.set(id, s)
 
   sock.ev.on('creds.update', saveCreds)
+  // Messages entrants
+sock.ev.on('messages.upsert', async (m) => {
+  const msg = m.messages?.[0]
+  if (!msg || !msg.key?.remoteJid) return
+
+  // Texte du message (simples cas)
+  const text =
+      msg.message?.conversation
+   || msg.message?.extendedTextMessage?.text
+   || msg.message?.imageMessage?.caption
+   || ''
+
+  app.log.info({ inbound: { from: msg.key.remoteJid, text } })
+
+  // (optionnel) auto-réponse de test
+  // await sock.sendMessage(msg.key.remoteJid, { text: '✅ Reçu !' })
+})
+
+  const API_KEY = process.env.API_KEY || ''
+
+app.post('/messages', async (req, reply) => {
+  if (API_KEY && req.headers['x-api-key'] !== API_KEY) {
+    return reply.code(401).send({ error: 'unauthorized' })
+  }
+  const { sessionId, to, text } = (req.body as any) || {}
+  const s = sessions.get(sessionId)
+  if (!s?.sock) return reply.code(400).send({ error: 'session not ready' })
+  const jid = `${String(to).replace(/[^\d]/g,'')}@s.whatsapp.net`
+  await s.sock.sendMessage(jid, { text })
+  reply.send({ ok: true })
+})
+
   // 🔧 NOUVEAU: un seul handler centralisé
   sock.ev.on('connection.update', async (u) => onConnectionUpdate(s, u))
 
@@ -181,6 +213,14 @@ app.get('/sessions/:id', async (req, reply) => {
   if (!s) return reply.code(404).send({ error: 'unknown session' })
   return reply.send({ session_id: id, connected: s.connected, qr: s.qr || null, qr_text: s.qr_text || null })
 })
+
+app.get('/sessions/:id', async (req, reply) => {
+  const id = (req.params as any).id
+  const s = sessions.get(id)
+  if (!s) return reply.code(404).send({ error: 'unknown session' })
+  reply.send({ session_id: id, connected: s.connected, hasSock: !!s.sock })
+})
+
 
 // Optionnel: forcer un redémarrage manuel si besoin
 app.post('/sessions/:id/restart', async (req, reply) => {
