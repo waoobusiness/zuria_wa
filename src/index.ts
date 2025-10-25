@@ -9,13 +9,21 @@ import makeWASocket, {
   fetchLatestBaileysVersion
 } from '@whiskeysockets/baileys'
 
-import fs from 'fs'
-import path from 'path'
+import fs from 'node:fs'
+import path from 'node:path'
 
+/* =======================
+ *  CONFIG
+ * ======================= */
 const PORT = parseInt(process.env.PORT || '3001', 10)
-// Sur Render, pointe vers le disque monté (ex: /var/data/wa-auth)
+// Sur Render, pointe vers le disque monté (ex: /var/data/wa)
 const AUTH_DIR = process.env.AUTH_DIR || './.wa'
+// (optionnel) pour protéger /messages
+const API_KEY = process.env.API_KEY || ''
 
+/* =======================
+ *  TYPES & ETAT
+ * ======================= */
 type SessionState = {
   id: string
   qr?: string | null          // data:image/png;base64,...
@@ -27,9 +35,13 @@ type SessionState = {
 
 const sessions = new Map<string, SessionState>()
 
+/* =======================
+ *  SERVER
+ * ======================= */
 const app = Fastify({ logger: true })
 await app.register(cors, { origin: true })
 
+/* Page d’accueil minimale (création + polling QR) */
 app.get('/', async (_req, reply) => {
   const html = `
   <html><head><meta charset="utf-8"><title>Zuria WA</title></head>
@@ -59,8 +71,9 @@ app.get('/', async (_req, reply) => {
   reply.type('text/html').send(html)
 })
 
-/** ------------- helpers ------------- */
-
+/* =======================
+ *  HELPERS
+ * ======================= */
 function isRestartRequired(err: any) {
   // Baileys signale "restart required" avec le code 515
   const code = Number(err?.output?.statusCode ?? err?.status ?? err?.code)
@@ -106,8 +119,9 @@ async function onConnectionUpdate(s: SessionState, u: any) {
   }
 }
 
-/** ------------- lifecycle ------------- */
-
+/* =======================
+ *  LIFECYCLE
+ * ======================= */
 async function restartSession(id: string) {
   const s = sessions.get(id)
   if (!s) return
@@ -138,6 +152,19 @@ async function restartSession(id: string) {
   s.sock = sock
 
   sock.ev.on('creds.update', saveCreds)
+
+  // Messages entrants (log)
+  sock.ev.on('messages.upsert', async (m) => {
+    const msg = m.messages?.[0]
+    if (!msg || !msg.key?.remoteJid) return
+    const text =
+        msg.message?.conversation
+     || msg.message?.extendedTextMessage?.text
+     || msg.message?.imageMessage?.caption
+     || ''
+    app.log.info({ inbound: { from: msg.key.remoteJid, text } })
+  })
+
   sock.ev.on('connection.update', async (u) => onConnectionUpdate(s, u))
 }
 
@@ -159,26 +186,62 @@ async function startSession(id: string) {
   sessions.set(id, s)
 
   sock.ev.on('creds.update', saveCreds)
-  // Messages entrants
-sock.ev.on('messages.upsert', async (m) => {
-  const msg = m.messages?.[0]
-  if (!msg || !msg.key?.remoteJid) return
 
-  // Texte du message (simples cas)
-  const text =
-      msg.message?.conversation
-   || msg.message?.extendedTextMessage?.text
-   || msg.message?.imageMessage?.caption
-   || ''
+  // Messages entrants (log)
+  sock.ev.on('messages.upsert', async (m) => {
+    const msg = m.messages?.[0]
+    if (!msg || !msg.key?.remoteJid) return
+    const text =
+        msg.message?.conversation
+     || msg.message?.extendedTextMessage?.text
+     || msg.message?.imageMessage?.caption
+     || ''
+    app.log.info({ inbound: { from: msg.key.remoteJid, text } })
+  })
 
-  app.log.info({ inbound: { from: msg.key.remoteJid, text } })
+  // Connexion
+  sock.ev.on('connection.update', async (u) => onConnectionUpdate(s, u))
 
-  // (optionnel) auto-réponse de test
-  // await sock.sendMessage(msg.key.remoteJid, { text: '✅ Reçu !' })
+  return s
+}
+
+/* =======================
+ *  API
+ * ======================= */
+
+// Créer une session
+app.post('/sessions', async (_req, reply) => {
+  const id = uuid()
+  app.log.info({ msg: 'create session', id })
+  const s = await startSession(id)
+  await new Promise(res => setTimeout(res, 500))
+  return reply.send({ session_id: s.id })
 })
 
-  const API_KEY = process.env.API_KEY || ''
+// Etat d’une session
+app.get('/sessions/:id', async (req, reply) => {
+  const id = (req.params as any).id
+  const s = sessions.get(id)
+  if (!s) return reply.code(404).send({ error: 'unknown session' })
+  return reply.send({
+    session_id: id,
+    connected: s.connected,
+    hasSock: !!s.sock,
+    qr: s.qr || null,
+    qr_text: s.qr_text || null
+  })
+})
 
+// Forcer un redémarrage
+app.post('/sessions/:id/restart', async (req, reply) => {
+  const id = (req.params as any).id
+  const s = sessions.get(id)
+  if (!s) return reply.code(404).send({ error: 'unknown session' })
+  await restartSession(id)
+  return reply.send({ ok: true })
+})
+
+// Envoyer un message
 app.post('/messages', async (req, reply) => {
   if (API_KEY && req.headers['x-api-key'] !== API_KEY) {
     return reply.code(401).send({ error: 'unauthorized' })
@@ -188,61 +251,13 @@ app.post('/messages', async (req, reply) => {
   if (!s?.sock) return reply.code(400).send({ error: 'session not ready' })
   const jid = `${String(to).replace(/[^\d]/g,'')}@s.whatsapp.net`
   await s.sock.sendMessage(jid, { text })
-  reply.send({ ok: true })
-})
-
-  // 🔧 NOUVEAU: un seul handler centralisé
-  sock.ev.on('connection.update', async (u) => onConnectionUpdate(s, u))
-
-  return s
-}
-
-/** ------------- API ------------- */
-
-app.post('/sessions', async (_req, reply) => {
-  const id = uuid()
-  app.log.info({ msg: 'create session', id })
-  const s = await startSession(id)
-  await new Promise(res => setTimeout(res, 500))
-  return reply.send({ session_id: s.id })
-})
-
-app.get('/sessions/:id', async (req, reply) => {
-  const id = (req.params as any).id
-  const s = sessions.get(id)
-  if (!s) return reply.code(404).send({ error: 'unknown session' })
-  return reply.send({ session_id: id, connected: s.connected, qr: s.qr || null, qr_text: s.qr_text || null })
-})
-
-app.get('/sessions/:id', async (req, reply) => {
-  const id = (req.params as any).id
-  const s = sessions.get(id)
-  if (!s) return reply.code(404).send({ error: 'unknown session' })
-  reply.send({ session_id: id, connected: s.connected, hasSock: !!s.sock })
-})
-
-
-// Optionnel: forcer un redémarrage manuel si besoin
-app.post('/sessions/:id/restart', async (req, reply) => {
-  const id = (req.params as any).id
-  const s = sessions.get(id)
-  if (!s) return reply.code(404).send({ error: 'unknown session' })
-  await restartSession(id)
   return reply.send({ ok: true })
 })
 
-app.post('/messages', async (req, reply) => {
-  const { sessionId, to, text } = (req.body as any) || {}
-  const s = sessions.get(sessionId)
-  if (!s?.sock) return reply.code(400).send({ error: 'session not ready' })
-  const jid = `${String(to).replace(/[^\d]/g,'')}@s.whatsapp.net`
-  await s.sock.sendMessage(jid, { text })
-  return reply.send({ ok: true })
-})
-
+// Santé
 app.get('/health', async (_req, reply) => reply.send({ ok: true }))
 
-// --- Mini console d’envoi de message ---
+// Mini page /send pour tester
 app.get('/send', async (_req, reply) => {
   const html = `
   <html><head><meta charset="utf-8"><title>Envoyer un message</title></head>
@@ -250,7 +265,7 @@ app.get('/send', async (_req, reply) => {
     <h2>Envoyer un message WhatsApp</h2>
 
     <label>ID de session<br/>
-      <input id="sid" style="width:100%" value="9b115dd2-28e1-49d5-ba30-5176a9ea5408"/>
+      <input id="sid" style="width:100%" placeholder="colle ici ton session_id"/>
     </label>
     <div style="margin:8px 0">
       <button id="check">Vérifier statut</button>
@@ -308,9 +323,9 @@ app.get('/send', async (_req, reply) => {
   reply.type('text/html').send(html)
 })
 
-// --- fin mini console ---
-
-
+/* =======================
+ *  START
+ * ======================= */
 app.listen({ port: PORT, host: '0.0.0.0' }).then(() => {
   app.log.info(`HTTP server listening on ${PORT}`)
 })
