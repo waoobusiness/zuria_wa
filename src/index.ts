@@ -1,96 +1,241 @@
 import Fastify from 'fastify'
 import cors from '@fastify/cors'
+import fastifyStatic from '@fastify/static'
 import QRCode from 'qrcode'
 import { v4 as uuid } from 'uuid'
 
 import makeWASocket, {
   useMultiFileAuthState,
   DisconnectReason,
-  fetchLatestBaileysVersion
+  fetchLatestBaileysVersion,
+  downloadContentFromMessage
 } from '@whiskeysockets/baileys'
 
 import fs from 'fs'
 import path from 'path'
 
-// --------------------
-// CONFIG (env Render)
-// --------------------
+/* -------- CONFIG -------- */
 
 const PORT = parseInt(process.env.PORT || '3001', 10)
 
-// IMPORTANT : sur Render tu as AUTH_DIR=/var/data/wa
+// Dossier d'authentification (identité WhatsApp, clés, etc.)
 const AUTH_DIR = process.env.AUTH_DIR || './.wa'
 
-// Shared secret envoyé aux webhooks (header x-wa-signature)
+// Dossier où on sauve les médias reçus (images, vocaux, etc.)
+const MEDIA_DIR = process.env.MEDIA_DIR || path.join(AUTH_DIR, 'media')
+
+// URL publique de TON service Render
+// (doit finir sans slash)
+const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || 'https://zuria-wa.onrender.com'
+
+// Secret partagé pour sécuriser les webhooks (même secret côté Lovable)
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || ''
 
-// Pour protéger l'endpoint /messages (appel direct depuis Zuria par ex)
+// Clé API optionnelle pour l’envoi sortant (header x-api-key)
 const API_KEY = process.env.API_KEY || ''
 
 
-// --------------------
-// TYPES ET MEMOIRE
-// --------------------
+/* -------- TYPES -------- */
 
 type SessionState = {
   id: string
-
-  // QR code affiché côté / (page HTML) :
   qr?: string | null          // data:image/png;base64,...
-  qr_text?: string | null     // texte brut du QR
+  qr_text?: string | null     // QR brut (fallback)
   connected: boolean
-
-  // socket Baileys courant
   sock?: ReturnType<typeof makeWASocket>
   saveCreds?: () => Promise<void>
 
-  // webhook cible (URL envoyée par Zuria / Lovable)
-  webhookUrl?: string
-
-  // numéro WhatsApp lié à CETTE session (l'agent)
-  phoneNumber?: string
+  webhookUrl?: string         // où on envoie les events (Lovable)
+  webhookSecret?: string      // override du WEBHOOK_SECRET global si fourni
+  meId?: string | null        // genre "4176xxx:29@s.whatsapp.net"
+  meNumber?: string | null    // ex "4176xxx"
 }
 
-// toutes les sessions vivantes en RAM
 const sessions = new Map<string, SessionState>()
 
 
-// --------------------
-// FASTIFY SERVER
-// --------------------
+/* -------- FASTIFY BOOT -------- */
 
 const app = Fastify({ logger: true })
+
 await app.register(cors, { origin: true })
 
+// servir les médias statiquement à /media/<fichier>
+fs.mkdirSync(MEDIA_DIR, { recursive: true })
+await app.register(fastifyStatic, {
+  root: MEDIA_DIR,
+  prefix: '/media/',
+})
 
-// ---------------------------------------------------
-// HELPERS
-// ---------------------------------------------------
+/* -------- PAGE DE DEBUG SIMPLE -------- */
 
-// On transforme "41766085008@s.whatsapp.net" -> "41766085008"
-function extractPhoneFromJid(jid?: string | null): string | null {
-  if (!jid) return null
-  const match = jid.match(/^(\d+)[@:]/)
-  return match ? match[1] : null
+app.get('/', async (_req, reply) => {
+  const html = `
+  <html><head><meta charset="utf-8"><title>Zuria WA</title></head>
+  <body style="font-family: system-ui; max-width: 720px; margin: 40px auto;">
+    <h2>Zuria WhatsApp Gateway</h2>
+
+    <section style="padding:12px;border:1px solid #ccc;border-radius:8px;">
+      <h3>1. Créer une session</h3>
+      <button onclick="createSession()">Créer une session</button>
+      <div id="sessionBlock" style="margin-top:16px;font-family:monospace;"></div>
+    </section>
+
+    <section style="padding:12px;border:1px solid #ccc;border-radius:8px;margin-top:24px;">
+      <h3>2. Vérifier / Redémarrer une session</h3>
+      <label>Session ID<br/><input id="sid" style="width:100%"/></label>
+      <div style="margin:8px 0;">
+        <button onclick="checkStatus()">Vérifier statut</button>
+        <button onclick="restart()">Relancer session</button>
+      </div>
+      <pre id="statusOut" style="background:#000;color:#0f0;padding:8px;min-height:80px;white-space:pre-wrap;"></pre>
+    </section>
+
+    <section style="padding:12px;border:1px solid #ccc;border-radius:8px;margin-top:24px;">
+      <h3>3. Envoyer un message</h3>
+      <label>Numéro (ex: 41766085008)<br/>
+        <input id="to" style="width:100%" placeholder="chiffres uniquement"/>
+      </label>
+      <br/><br/>
+      <label>Message<br/>
+        <textarea id="text" style="width:100%;height:100px">Hello depuis Zuria 🚀</textarea>
+      </label>
+      <br/><br/>
+      <button onclick="sendMsg()">Envoyer</button>
+      <pre id="sendOut" style="background:#000;color:#0f0;padding:8px;min-height:60px;white-space:pre-wrap;"></pre>
+    </section>
+
+    <script>
+      async function createSession(){
+        const r = await fetch('/sessions', {method:'POST'})
+        const j = await r.json()
+        const block = document.getElementById('sessionBlock')
+        block.innerHTML = '<p><b>Session:</b> '+j.session_id+'</p><img id="qr" style="width:300px;border:1px solid #ccc;border-radius:4px;">'
+        document.getElementById('sid').value = j.session_id
+        const img = document.getElementById('qr')
+        const interval = setInterval(async ()=>{
+          const r2 = await fetch('/sessions/'+j.session_id)
+          const s = await r2.json()
+          if(s.qr){ img.src = s.qr }
+          else if (s.qr_text && !s.connected) {
+            // fallback QR côté client si pas d'image base64
+            img.src = 'https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=' + encodeURIComponent(s.qr_text)
+          }
+          if(s.connected){
+            clearInterval(interval);
+            img.remove();
+            block.innerHTML += '<p>✅ Connecté comme '+(s.me_number||'?')+'</p>'
+          }
+        }, 1500)
+      }
+
+      async function checkStatus(){
+        const sid = document.getElementById('sid').value.trim()
+        const r = await fetch('/sessions/'+sid)
+        const j = await r.json()
+        document.getElementById('statusOut').textContent = JSON.stringify(j,null,2)
+      }
+
+      async function restart(){
+        const sid = document.getElementById('sid').value.trim()
+        const r = await fetch('/sessions/'+sid+'/restart', { method: 'POST' })
+        const j = await r.json()
+        document.getElementById('statusOut').textContent = JSON.stringify(j,null,2)
+      }
+
+      async function sendMsg(){
+        const sid = document.getElementById('sid').value.trim()
+        const to = document.getElementById('to').value.trim()
+        const text = document.getElementById('text').value
+        const r = await fetch('/messages', {
+          method:'POST',
+          headers:{ 'Content-Type':'application/json' },
+          body: JSON.stringify({ sessionId: sid, to, text })
+        })
+        const j = await r.json()
+        document.getElementById('sendOut').textContent = JSON.stringify(j,null,2)
+      }
+    </script>
+  </body></html>`
+  reply.type('text/html').send(html)
+})
+
+
+/* -------- HELPERS -------- */
+
+// pour donner une extension de fichier correcte
+function guessExt(mime: string) {
+  const map: Record<string,string> = {
+    'image/jpeg': 'jpg',
+    'image/jpg': 'jpg',
+    'image/png': 'png',
+    'image/webp': 'webp',
+    'video/mp4': 'mp4',
+    'video/quicktime': 'mov',
+    'audio/ogg; codecs=opus': 'ogg',
+    'audio/ogg': 'ogg',
+    'audio/mpeg': 'mp3',
+    'audio/mp4': 'm4a',
+    'application/pdf': 'pdf',
+  }
+  return map[mime] || 'bin'
 }
 
-// Envoi d'un event vers la plateforme (Zuria / Supabase / Lovable)
-async function pushWebhookEvent(
-  s: SessionState,
-  event: string,
-  data: any
+// sauvegarder un Buffer (image, audio, etc.) dans MEDIA_DIR
+async function saveMediaFile(buf: Buffer, mimeType: string) {
+  fs.mkdirSync(MEDIA_DIR, { recursive: true })
+
+  const ext = guessExt(mimeType)
+  const filename = `${Date.now()}-${Math.random().toString(36).slice(2)}.${ext}`
+  const absPath = path.join(MEDIA_DIR, filename)
+
+  fs.writeFileSync(absPath, buf)
+
+  const publicUrl = `${PUBLIC_BASE_URL}/media/${filename}`
+
+  return {
+    filename,
+    mimeType,
+    url: publicUrl,
+  }
+}
+
+// télécharger le média depuis Baileys (imageMessage, audioMessage, etc.)
+async function fetchMediaBuffer(
+  baileysMsgPart: any,
+  mediaType: 'image' | 'video' | 'audio' | 'document'
 ) {
+  const stream = await downloadContentFromMessage(baileysMsgPart, mediaType)
+  let buffer = Buffer.from([])
+  for await (const chunk of stream) {
+    buffer = Buffer.concat([buffer, chunk])
+  }
+  return buffer
+}
+
+// Baileys dit "j'ai besoin d'un restart" => code 515 ou DisconnectReason.restartRequired
+function isRestartRequired(err: any) {
+  const code = Number(err?.output?.statusCode ?? err?.status ?? err?.code)
+  return code === 515 || code === DisconnectReason.restartRequired
+}
+
+// envoi d'un event webhook vers Zuria/Lovable
+async function sendWebhookEvent(s: SessionState, payload: {
+  event: string
+  data: any
+  ts: number
+}) {
   if (!s.webhookUrl) {
-    // pas de webhook enregistré => rien à envoyer
+    // pas de webhook configuré pour cette session => on log juste
+    app.log.warn({ msg: 'no webhookUrl for session, drop event', sessionId: s.id })
     return
   }
 
-  const payload = {
+  const signature = s.webhookSecret || WEBHOOK_SECRET || ''
+
+  const body = {
     sessionId: s.id,
-    event, // "message.in", "message.out", "session.connected", ...
-    data,
-    ts: Date.now(),
-    sessionPhone: s.phoneNumber || null
+    ...payload
   }
 
   try {
@@ -98,50 +243,36 @@ async function pushWebhookEvent(
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'x-wa-signature': WEBHOOK_SECRET || ''
+        'x-wa-signature': signature
       },
-      body: JSON.stringify(payload)
+      body: JSON.stringify(body)
     })
-
     app.log.info({
-      webhook_push: {
-        session: s.id,
-        event,
+      webhookPush: {
+        sessionId: s.id,
         status: res.status
       }
     })
-  } catch (err: any) {
+  } catch (e: any) {
     app.log.error({
       msg: 'webhook push failed',
-      session: s.id,
-      event,
-      err: String(err)
+      sessionId: s.id,
+      err: String(e)
     })
   }
 }
 
-// Baileys nous dit "restart required" avec le code 515
-function isRestartRequired(err: any) {
-  const code = Number(err?.output?.statusCode ?? err?.status ?? err?.code)
-  return code === 515 || code === DisconnectReason.restartRequired
-}
-
-
-// ---------------------------------------------------
-// GESTION DES MISES À JOUR DE CONNEXION
-// ---------------------------------------------------
-
+// handler commun pour les updates de connexion WhatsApp
 async function onConnectionUpdate(s: SessionState, u: any) {
-  // petit log pour Render
   app.log.info({
     wa_update: {
       conn: u.connection,
       hasQR: !!u.qr,
-      disc: !!u.lastDisconnect
+      disc: !!u.lastDisconnect,
     }
   })
 
-  // nouveau QR reçu -> on le stocke
+  // si Baileys nous a donné un QR => on le stocke pour l'UI
   if (u.qr) {
     s.qr_text = u.qr
     try {
@@ -152,156 +283,93 @@ async function onConnectionUpdate(s: SessionState, u: any) {
     }
   }
 
-  // connexion OK
+  // si on est connecté
   if (u.connection === 'open') {
     s.connected = true
     s.qr = null
     s.qr_text = null
 
-    // essaie de récupérer le numéro du compte WhatsApp lié
-    // ex dans les logs Render on voit "me":{"id":"41766085008:29@s.whatsapp.net",...}
-    const selfJid =
-      (s.sock as any)?.user?.id ||
-      (s.sock as any)?.user ||
-      ''
-
-    const phone = extractPhoneFromJid(
-      typeof selfJid === 'string'
-        ? selfJid
-        : (selfJid?.toString?.() || '')
-    )
-    if (phone) {
-      s.phoneNumber = phone
+    // récupérer le numéro du compte (quand dispo)
+    if (u.me?.id) {
+      s.meId = u.me.id
+      // exemple "41766085008:29@s.whatsapp.net"
+      // on garde juste le numéro avant le ":" et avant "@"
+      const raw = String(u.me.id)
+      const numPart = raw.split('@')[0].split(':')[0]
+      s.meNumber = numPart || null
     }
 
-    // prévenir Zuria
-    await pushWebhookEvent(s, 'session.connected', {
-      phoneNumber: s.phoneNumber || null,
+    // webhook "session.connected"
+    await sendWebhookEvent(s, {
+      event: 'session.connected',
+      data: {
+        meId: s.meId || null,
+        phoneNumber: s.meNumber || null,
+      },
+      ts: Date.now()
     })
 
     return
   }
 
-  // déconnexion
+  // si fermeture
   if (u.connection === 'close') {
     const err = (u.lastDisconnect as any)?.error
 
-    // Cas A : 515 => il faut juste recréer le socket
+    // 515 => restart complet (recréer un socket)
     if (isRestartRequired(err)) {
-      app.log.warn({
-        msg: 'restart required (515) — restarting socket',
-        id: s.id
-      })
+      app.log.warn({ msg: 'restart required (515) — restarting socket', id: s.id })
       await restartSession(s.id)
       return
     }
 
-    // Cas B : vraiment déloggué
-    const code = Number(
-      err?.output?.statusCode ?? err?.status ?? err?.code
-    )
+    // loggedOut => plus connecté du tout, QR devra être rescanné
+    const code = Number(err?.output?.statusCode ?? err?.status ?? err?.code)
     if (code === DisconnectReason.loggedOut) {
       s.connected = false
-      await pushWebhookEvent(s, 'session.disconnected', {
-        reason: 'logged_out'
-      })
-      app.log.warn({
-        msg: 'logged out — rescan required',
-        id: s.id
+      app.log.warn({ msg: 'logged out — rescan required', id: s.id })
+
+      await sendWebhookEvent(s, {
+        event: 'session.disconnected',
+        data: { reason: 'logged_out' },
+        ts: Date.now()
       })
       return
     }
 
-    // Cas C : autre
+    // autres cas => Baileys va essayer de se reconnecter
     s.connected = false
-    await pushWebhookEvent(s, 'session.disconnected', {
-      reason: 'connection_closed',
-      code
+
+    await sendWebhookEvent(s, {
+      event: 'session.disconnected',
+      data: { reason: 'closed' },
+      ts: Date.now()
     })
   }
 }
 
+/* -------- LIFECYCLE SOCKET -------- */
 
-// ---------------------------------------------------
-// GESTION DES MESSAGES (ENTRANTS / SORTANTS)
-// ---------------------------------------------------
-
-// Cette fonction va être branchée sur sock.ev.on('messages.upsert')
-function attachMessagesHandler(s: SessionState, sock: any) {
-  sock.ev.on('messages.upsert', async (m: any) => {
-    // On ne gère que les nouveaux messages (notify), pas l'historique
-    if (m.type !== 'notify') return
-
-    const msg = m.messages?.[0]
-    if (!msg || !msg.key?.remoteJid) return
-
-    // --- infos conversation ---
-    const chatJid = msg.key.remoteJid                       // "4176xxxxxxx@s.whatsapp.net"
-    const chatNumber = extractPhoneFromJid(chatJid) || ''   // "4176xxxxxxx"
-
-    // --- contenu du message ---
-    const text =
-      msg.message?.conversation ||
-      msg.message?.extendedTextMessage?.text ||
-      msg.message?.imageMessage?.caption ||
-      ''
-
-    // --- est-ce un message envoyé PAR NOUS (depuis ce compte WhatsApp) ? ---
-    const fromMe = msg.key.fromMe === true
-
-    // log debug dans Render
-    app.log.info({
-      inbound: {
-        sessionId: s.id,
-        chatJid,
-        chatNumber,
-        text,
-        fromMe
-      }
-    })
-
-    // webhook vers Zuria / Lovable
-    await pushWebhookEvent(
-      s,
-      fromMe ? 'message.out' : 'message.in',
-      {
-        chatJid,      // "4176...@s.whatsapp.net"
-        chatNumber,   // "4176..."
-        text,         // contenu
-        fromMe        // true si c'est nous; false si c'est le client
-      }
-    )
-  })
-}
-
-
-// ---------------------------------------------------
-// (RE)CRÉATION D'UNE SESSION
-// ---------------------------------------------------
-
+// recréer un socket Baileys en gardant le même dossier d'auth
 async function restartSession(id: string) {
   const s = sessions.get(id)
   if (!s) return
 
-  app.log.warn({ msg: 'restart WA session (515)', id })
+  app.log.warn({ msg: 'restart WA session (manual/515)', id })
 
-  // nettoyer l'ancien socket
+  // on nettoie l'ancien socket
   try { (s.sock as any)?.ev?.removeAllListeners?.() } catch {}
   try { (s.sock as any)?.ws?.close?.() } catch {}
-
   s.sock = undefined
   s.connected = false
   s.qr = null
   s.qr_text = null
 
-  // recharge l'état d'auth depuis le disque
-  const { state, saveCreds } = await useMultiFileAuthState(
-    path.join(AUTH_DIR, id)
-  )
+  // on recrée
+  const { state, saveCreds } = await useMultiFileAuthState(path.join(AUTH_DIR, id))
   const { version } = await fetchLatestBaileysVersion()
 
   s.saveCreds = saveCreds
-
   const sock = makeWASocket({
     version,
     auth: state,
@@ -312,21 +380,23 @@ async function restartSession(id: string) {
   })
   s.sock = sock
 
-  // brancher les listeners
+  // listeners de base
   sock.ev.on('creds.update', saveCreds)
-  sock.ev.on('connection.update', async (u: any) =>
-    onConnectionUpdate(s, u)
-  )
-  attachMessagesHandler(s, sock)
+
+  // messages entrants
+  sock.ev.on('messages.upsert', async (m) => {
+    await handleIncomingMessages(s, m)
+  })
+
+  // connexion / déconnexion / QR
+  sock.ev.on('connection.update', async (u) => onConnectionUpdate(s, u))
 }
 
+// créer une nouvelle session (nouveau dossier d'auth)
 async function startSession(id: string) {
-  // s'assurer que le dossier d'auth existe
   fs.mkdirSync(path.join(AUTH_DIR, id), { recursive: true })
 
-  const { state, saveCreds } = await useMultiFileAuthState(
-    path.join(AUTH_DIR, id)
-  )
+  const { state, saveCreds } = await useMultiFileAuthState(path.join(AUTH_DIR, id))
   const { version } = await fetchLatestBaileysVersion()
 
   const s: SessionState = {
@@ -334,7 +404,9 @@ async function startSession(id: string) {
     qr: null,
     qr_text: null,
     connected: false,
-    saveCreds
+    saveCreds,
+    meId: null,
+    meNumber: null
   }
 
   const sock = makeWASocket({
@@ -345,241 +417,204 @@ async function startSession(id: string) {
     connectTimeoutMs: 60_000,
     defaultQueryTimeoutMs: 60_000
   })
-
   s.sock = sock
   sessions.set(id, s)
 
-  // brancher les listeners
   sock.ev.on('creds.update', saveCreds)
-  sock.ev.on('connection.update', async (u: any) =>
-    onConnectionUpdate(s, u)
-  )
-  attachMessagesHandler(s, sock)
+
+  sock.ev.on('messages.upsert', async (m) => {
+    await handleIncomingMessages(s, m)
+  })
+
+  sock.ev.on('connection.update', async (u) => onConnectionUpdate(s, u))
 
   return s
 }
 
+/* -------- TRAITEMENT DES MESSAGES ENTRANTS -------- */
 
-// ---------------------------------------------------
-// ROUTES HTTP
-// ---------------------------------------------------
+async function handleIncomingMessages(s: SessionState, m: any) {
+  const msg = m.messages?.[0]
+  if (!msg || !msg.key?.remoteJid) return
+  if (!msg.message) return // pas de contenu utile (accusés de réception etc.)
+  if (msg.key.remoteJid === 'status@broadcast') return // on ignore le statut WhatsApp
 
-// Petit dashboard minimal (scan QR etc.)
-app.get('/', async (_req, reply) => {
-  const html = `
-  <html><head><meta charset="utf-8"><title>Zuria WA</title></head>
-  <body style="font-family: system-ui; max-width: 720px; margin: 40px auto;">
-    <h2>Zuria WhatsApp Gateway</h2>
-    <button onclick="createSession()">Créer une session</button>
-    <div style="margin-top:16px" id="out"></div>
+  const fromJid = msg.key.remoteJid // "4176xxxx@s.whatsapp.net" ou un groupe "...@g.us"
+  const fromMe = !!msg.key.fromMe
+  const phoneNumberGuess = fromJid.split('@')[0] // juste la partie avant @
+  const timestamp = Number(msg.messageTimestamp || Date.now())
 
-    <script>
-      async function createSession(){
-        const r = await fetch('/sessions', {method:'POST'})
-        const j = await r.json()
-        const out = document.getElementById('out')
-        out.innerHTML = '<p><b>Session:</b> '+j.session_id+'</p><img id="qr" style="width:300px">'
+  const mcontent = msg.message
 
-        const img = document.getElementById('qr')
+  // payload de base qu'on va envoyer au webhook
+  const payload: any = {
+    from: phoneNumberGuess,
+    fromJid,
+    fromMe,
+    type: 'text',
+    text: ''
+  }
 
-        // on poll l'état de la session toutes les 1.5s
-        const interval = setInterval(async ()=>{
-          const r2 = await fetch('/sessions/'+j.session_id)
-          const s = await r2.json()
+  // 1. TEXTE pur / caption
+  if (mcontent.conversation) {
+    payload.type = 'text'
+    payload.text = mcontent.conversation
+  } else if (mcontent.extendedTextMessage?.text) {
+    payload.type = 'text'
+    payload.text = mcontent.extendedTextMessage.text
+  }
 
-          if(s.qr){ img.src = s.qr }
-          else if (s.qr_text) {
-            // fallback si pas de dataURL dispo
-            img.src = 'https://api.qrserver.com/v1/create-qr-code/?size=300x300&data='
-                      + encodeURIComponent(s.qr_text)
-          }
+  // 2. IMAGE
+  if (mcontent.imageMessage) {
+    const buf = await fetchMediaBuffer(mcontent.imageMessage, 'image')
+    const mime = mcontent.imageMessage.mimetype || 'image/jpeg'
+    const saved = await saveMediaFile(buf, mime)
 
-          if(s.connected){
-            clearInterval(interval)
-            img.remove()
-            out.innerHTML += '<p>✅ Connecté</p>'
-            if (s.phoneNumber){
-              out.innerHTML += '<p><b>Numéro WhatsApp lié :</b> '+s.phoneNumber+'</p>'
-            }
-            out.innerHTML += '<p>Tu peux maintenant aller sur /send pour tester l\\'envoi de message.</p>'
-          }
-        }, 1500)
-      }
-    </script>
-  </body></html>`
-  reply.type('text/html').send(html)
-})
+    payload.type = 'image'
+    payload.text = mcontent.imageMessage.caption || ''
+    payload.mimeType = saved.mimeType
+    payload.mediaUrl = saved.url
+  }
 
-// Mini console manuelle pour tester envoi de messages
-app.get('/send', async (_req, reply) => {
-  const html = `
-  <html><head><meta charset="utf-8"><title>Envoyer un message</title></head>
-  <body style="font-family: system-ui; max-width: 700px; margin: 40px auto;">
-    <h2>Envoyer un message WhatsApp</h2>
+  // 3. VIDEO (y compris GIF animé WhatsApp => gifPlayback === true)
+  else if (mcontent.videoMessage) {
+    const buf = await fetchMediaBuffer(mcontent.videoMessage, 'video')
+    const mime = mcontent.videoMessage.mimetype || 'video/mp4'
+    const saved = await saveMediaFile(buf, mime)
 
-    <label>ID de session<br/>
-      <input id="sid" style="width:100%"/>
-    </label>
-    <div style="margin:8px 0">
-      <button id="check">Vérifier statut</button>
-      <button id="restart">Relancer</button>
-    </div>
+    payload.type = mcontent.videoMessage.gifPlayback ? 'gif' : 'video'
+    payload.text = mcontent.videoMessage.caption || ''
+    payload.mimeType = saved.mimeType
+    payload.mediaUrl = saved.url
+  }
 
-    <label>Numéro (ex: 41766085008)<br/>
-      <input id="to" style="width:100%" placeholder="chiffres uniquement"/>
-    </label>
-    <br/><br/>
-    <label>Message<br/>
-      <textarea id="text" style="width:100%; height:120px">Hello depuis Zuria 🚀</textarea>
-    </label>
-    <br/><br/>
-    <button id="btn">Envoyer</button>
+  // 4. AUDIO / NOTE VOCALE
+  else if (mcontent.audioMessage) {
+    const buf = await fetchMediaBuffer(mcontent.audioMessage, 'audio')
+    const mime = mcontent.audioMessage.mimetype || 'audio/ogg'
+    const saved = await saveMediaFile(buf, mime)
 
-    <pre id="out" style="background:#111;color:#0f0;padding:12px;margin-top:16px;white-space:pre-wrap;"></pre>
+    payload.type = mcontent.audioMessage.ptt ? 'voice' : 'audio'
+    payload.mimeType = saved.mimeType
+    payload.mediaUrl = saved.url
+    payload.durationSeconds = mcontent.audioMessage.seconds
+    payload.isVoiceNote = !!mcontent.audioMessage.ptt
+  }
 
-    <script>
-      const out = document.getElementById('out')
+  // 5. DOCUMENT / PDF / etc
+  else if (mcontent.documentMessage) {
+    const buf = await fetchMediaBuffer(mcontent.documentMessage, 'document')
+    const mime = mcontent.documentMessage.mimetype || 'application/octet-stream'
+    const saved = await saveMediaFile(buf, mime)
 
-      document.getElementById('check').onclick = async () => {
-        const sid = document.getElementById('sid').value.trim()
-        const r = await fetch('/sessions/' + sid)
-        const j = await r.json()
-        out.textContent = JSON.stringify(j, null, 2)
-      }
+    payload.type = 'document'
+    payload.mimeType = saved.mimeType
+    payload.mediaUrl = saved.url
+    payload.fileName = mcontent.documentMessage.fileName || null
+  }
 
-      document.getElementById('restart').onclick = async () => {
-        const sid = document.getElementById('sid').value.trim()
-        const r = await fetch('/sessions/' + sid + '/restart', { method: 'POST' })
-        const j = await r.json()
-        out.textContent = JSON.stringify(j, null, 2)
-      }
+  app.log.info({ inbound: payload })
 
-      document.getElementById('btn').onclick = async () => {
-        const sessionId = document.getElementById('sid').value.trim()
-        const to = document.getElementById('to').value.trim()
-        const text = document.getElementById('text').value
-        out.textContent = 'Envoi en cours...'
-        try {
-          const r = await fetch('/messages', {
-            method:'POST',
-            headers:{ 'Content-Type':'application/json' },
-            body: JSON.stringify({ sessionId, to, text })
-          })
-          const j = await r.json()
-          out.textContent = JSON.stringify(j, null, 2)
-        } catch (e) {
-          out.textContent = 'Erreur: ' + e
-        }
-      }
-    </script>
-  </body></html>`
-  reply.type('text/html').send(html)
-})
+  // push vers la plateforme via webhook
+  await sendWebhookEvent(s, {
+    event: 'message.in',
+    data: payload,
+    ts: timestamp
+  })
+}
 
 
-// Crée une nouvelle session WhatsApp
+/* -------- ROUTES API -------- */
+
+// 1. Créer une session (et donc un QR à scanner)
 app.post('/sessions', async (_req, reply) => {
   const id = uuid()
   app.log.info({ msg: 'create session', id })
   const s = await startSession(id)
 
-  // petite pause pour laisser Baileys initialiser
+  // petite pause pour laisser Baileys démarrer et générer le QR
   await new Promise(res => setTimeout(res, 500))
 
-  reply.send({ session_id: s?.id })
+  return reply.send({ session_id: s.id })
 })
 
-
-// Récupère l'état actuel d'une session
+// 2. Lire l'état d'une session
 app.get('/sessions/:id', async (req, reply) => {
   const id = (req.params as any).id
   const s = sessions.get(id)
   if (!s) {
     return reply.code(404).send({ error: 'unknown session' })
   }
-
-  reply.send({
+  return reply.send({
     session_id: id,
     connected: s.connected,
     qr: s.qr || null,
     qr_text: s.qr_text || null,
-    hasSock: !!s.sock,
-    phoneNumber: s.phoneNumber || null,
-    webhookUrl: s.webhookUrl || null
+    me_number: s.meNumber || null
   })
 })
 
+// 3. Enregistrer / mettre à jour l’URL webhook pour cette session
+// body attendu: { "url": "...", "secret": "..." }
+app.post('/sessions/:id/webhook', async (req, reply) => {
+  const id = (req.params as any).id
+  const { url, secret } = (req.body as any) || {}
+  const s = sessions.get(id)
+  if (!s) {
+    return reply.code(404).send({ error: 'unknown session' })
+  }
+  s.webhookUrl = url
+  s.webhookSecret = secret || WEBHOOK_SECRET
+  return reply.send({ ok: true })
+})
 
-// Forcer un redémarrage manuel de la session (utilise restartSession)
+// 4. Forcer un redémarrage manuel si besoin
 app.post('/sessions/:id/restart', async (req, reply) => {
   const id = (req.params as any).id
   const s = sessions.get(id)
   if (!s) return reply.code(404).send({ error: 'unknown session' })
-
   await restartSession(id)
-  reply.send({ ok: true })
+  return reply.send({ ok: true })
 })
 
-
-// Enregistrer le webhook URL pour une session
-// (c'est ce que la plateforme Zuria/Lovable va appeler après avoir créé la session)
-app.post('/sessions/:id/webhook', async (req, reply) => {
-  const id = (req.params as any).id
-  const body = (req.body as any) || {}
-  const { url } = body
-
-  const s = sessions.get(id)
-  if (!s) return reply.code(404).send({ error: 'unknown session' })
-  if (!url) return reply.code(400).send({ error: 'missing url' })
-
-  s.webhookUrl = url
-
-  reply.send({ ok: true })
-})
-
-
-// Envoyer un message sortant
-// Body attendu:
-// {
-//   "sessionId": "...",
-//   "to": "4176xxxxxxx",
-//   "text": "Hello depuis Zuria 👋"
-// }
+// 5. Envoyer un message sortant
+// body attendu: { sessionId, to, text }
+// (tu peux étendre plus tard pour image/audio sortant)
 app.post('/messages', async (req, reply) => {
-  // sécurité basique par clé
   if (API_KEY && req.headers['x-api-key'] !== API_KEY) {
     return reply.code(401).send({ error: 'unauthorized' })
   }
 
   const { sessionId, to, text } = (req.body as any) || {}
   const s = sessions.get(sessionId)
+  if (!s?.sock) return reply.code(400).send({ error: 'session not ready' })
 
-  if (!s?.sock) {
-    return reply.code(400).send({ error: 'session not ready' })
-  }
-
-  const cleanNumber = String(to).replace(/[^\d]/g, '')
-  const jid = `${cleanNumber}@s.whatsapp.net`
+  const jid = `${String(to).replace(/[^\d]/g, '')}@s.whatsapp.net`
 
   await s.sock.sendMessage(jid, { text })
 
-  // on push aussi un event "message.out" pour cohérence UI (bulle envoyée)
-  await pushWebhookEvent(s, 'message.out', {
-    chatJid: jid,
-    chatNumber: cleanNumber,
-    text,
-    fromMe: true
+  // IMPORTANT : notifier le webhook que c'est un message "sortant"
+  await sendWebhookEvent(s, {
+    event: 'message.in', // tu peux aussi décider 'message.out' côté Lovable
+    data: {
+      from: s.meNumber || null,
+      fromJid: s.meId || null,
+      fromMe: true,
+      to: jid,
+      type: 'text',
+      text
+    },
+    ts: Date.now()
   })
 
-  reply.send({ ok: true })
+  return reply.send({ ok: true })
 })
 
-
-// Healthcheck Render
+// 6. Healthcheck pour Render
 app.get('/health', async (_req, reply) => reply.send({ ok: true }))
 
+/* -------- START HTTP SERVER -------- */
 
-// Lancer le serveur HTTP
 app.listen({ port: PORT, host: '0.0.0.0' }).then(() => {
   app.log.info(`HTTP server listening on ${PORT}`)
 })
