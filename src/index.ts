@@ -4,7 +4,8 @@ import QRCode from 'qrcode'
 import { v4 as uuid } from 'uuid'
 import makeWASocket, {
   useMultiFileAuthState,
-  DisconnectReason
+  DisconnectReason,
+  fetchLatestBaileysVersion
 } from '@whiskeysockets/baileys'
 import fs from 'fs'
 import path from 'path'
@@ -14,7 +15,8 @@ const AUTH_DIR = process.env.AUTH_DIR || './.wa'
 
 type SessionState = {
   id: string
-  qr?: string | null
+  qr?: string | null          // data:image/png;base64,...
+  qr_text?: string | null     // texte brut du QR (fallback)
   connected: boolean
   sock?: ReturnType<typeof makeWASocket>
   saveCreds?: () => Promise<void>
@@ -42,7 +44,11 @@ app.get('/', async (_req, reply) => {
         const interval = setInterval(async ()=>{
           const r2 = await fetch('/sessions/'+j.session_id)
           const s = await r2.json()
-          if(s.qr) img.src = s.qr
+          if(s.qr){ img.src = s.qr }
+          else if (s.qr_text) {
+            // fallback : on génère une image à la volée côté client
+            img.src = 'https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=' + encodeURIComponent(s.qr_text)
+          }
           if(s.connected){ clearInterval(interval); img.remove(); out.innerHTML += '<p>✅ Connecté</p>' }
         }, 1500)
       }
@@ -54,20 +60,40 @@ app.get('/', async (_req, reply) => {
 async function startSession(id: string) {
   fs.mkdirSync(path.join(AUTH_DIR, id), { recursive: true })
   const { state, saveCreds } = await useMultiFileAuthState(path.join(AUTH_DIR, id))
-  const s: SessionState = { id, qr: null, connected: false, saveCreds }
-  const sock = makeWASocket({ auth: state, printQRInTerminal: false })
+  const { version } = await fetchLatestBaileysVersion()
+
+  const s: SessionState = { id, qr: null, qr_text: null, connected: false, saveCreds }
+  const sock = makeWASocket({
+    version,
+    auth: state,
+    printQRInTerminal: false,
+    browser: ['Zuria', 'Chrome', '120.0.0.0'],
+    connectTimeoutMs: 60_000,
+    defaultQueryTimeoutMs: 60_000
+  })
   s.sock = sock
   sessions.set(id, s)
 
   sock.ev.on('creds.update', saveCreds)
   sock.ev.on('connection.update', async (u) => {
-    if (u.qr) s.qr = await QRCode.toDataURL(u.qr)
-    if (u.connection === 'open') { s.connected = true; s.qr = null }
+    // logs utiles pour vérifier côté Render
+    app.log.info({ wa_update: { conn: u.connection, hasQR: !!u.qr, disc: !!u.lastDisconnect } })
+
+    if (u.qr) {
+      s.qr_text = u.qr
+      try { s.qr = await QRCode.toDataURL(u.qr) } catch (e) {
+        s.qr = null
+        app.log.warn({ msg: 'qr toDataURL failed', err: String(e) })
+      }
+    }
+    if (u.connection === 'open') { s.connected = true; s.qr = null; s.qr_text = null }
     if (u.connection === 'close') {
-      const reason = (u.lastDisconnect?.error as any)?.output?.statusCode
-      const shouldReconnect = reason !== DisconnectReason.loggedOut
+      const code = (u.lastDisconnect?.error as any)?.output?.statusCode
+      const shouldReconnect = code !== DisconnectReason.loggedOut
       s.connected = false
-      if (shouldReconnect) { /* auto-reconnect géré par Baileys */ }
+      if (shouldReconnect) {
+        // auto-reconnect géré par Baileys
+      }
     }
   })
   return s
@@ -75,8 +101,9 @@ async function startSession(id: string) {
 
 app.post('/sessions', async (_req, reply) => {
   const id = uuid()
+  app.log.info({ msg: 'create session', id })
   const s = await startSession(id)
-  await new Promise(res => setTimeout(res, 1000))
+  await new Promise(res => setTimeout(res, 500))
   return reply.send({ session_id: s.id })
 })
 
@@ -84,7 +111,7 @@ app.get('/sessions/:id', async (req, reply) => {
   const id = (req.params as any).id
   const s = sessions.get(id)
   if (!s) return reply.code(404).send({ error: 'unknown session' })
-  return reply.send({ session_id: id, connected: s.connected, qr: s.qr || null })
+  return reply.send({ session_id: id, connected: s.connected, qr: s.qr || null, qr_text: s.qr_text || null })
 })
 
 app.post('/messages', async (req, reply) => {
