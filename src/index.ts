@@ -12,6 +12,14 @@ import makeWASocket, {
 import fs from 'fs'
 import path from 'path'
 
+function extractPhoneFromJid(jid?: string | null): string | null {
+  if (!jid) return null
+  // Exemple jid: "41766085008:29@s.whatsapp.net"
+  const match = jid.match(/^(\d+)[@:]/)
+  return match ? match[1] : null
+}
+
+
 // ---------- CONFIG ----------
 const PORT = parseInt(process.env.PORT || '3001', 10)
 // tu peux créer un disque Render plus tard (ex: /var/data/wa-auth)
@@ -32,6 +40,7 @@ type SessionState = {
   qr?: string | null          // data:image/png;base64,...
   qr_text?: string | null     // texte brut (fallback si pas d'image)
   connected: boolean
+  phone?: string | null            // 👈 NOUVEAU : numéro WhatsApp lié
   sock?: ReturnType<typeof makeWASocket>
   saveCreds?: () => Promise<void>
 
@@ -282,6 +291,7 @@ async function startSession(id: string) {
     qr: null,
     qr_text: null,
     connected: false,
+    phone: null,          // 👈 nouveau
     saveCreds,
     webhookUrl: null,
     webhookSecret: null,
