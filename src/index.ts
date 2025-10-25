@@ -13,7 +13,7 @@ import fs from 'fs'
 import path from 'path'
 
 const PORT = parseInt(process.env.PORT || '3001', 10)
-// Sur Render on va pointer vers un disque: /var/data/wa
+// Sur Render, pointe vers le disque monté (ex: /var/data/wa-auth)
 const AUTH_DIR = process.env.AUTH_DIR || './.wa'
 
 type SessionState = {
@@ -58,6 +58,56 @@ app.get('/', async (_req, reply) => {
   </body></html>`
   reply.type('text/html').send(html)
 })
+
+/** ------------- helpers ------------- */
+
+function isRestartRequired(err: any) {
+  // Baileys signale "restart required" avec le code 515
+  const code = Number(err?.output?.statusCode ?? err?.status ?? err?.code)
+  return code === 515 || code === DisconnectReason.restartRequired
+}
+
+async function onConnectionUpdate(s: SessionState, u: any) {
+  app.log.info({ wa_update: { conn: u.connection, hasQR: !!u.qr, disc: !!u.lastDisconnect } })
+
+  if (u.qr) {
+    s.qr_text = u.qr
+    try { s.qr = await QRCode.toDataURL(u.qr) }
+    catch (e) { s.qr = null; app.log.warn({ msg: 'qr toDataURL failed', err: String(e) }) }
+  }
+
+  if (u.connection === 'open') {
+    s.connected = true
+    s.qr = null
+    s.qr_text = null
+    return
+  }
+
+  if (u.connection === 'close') {
+    const err = (u.lastDisconnect as any)?.error
+
+    // (A) 515 => redémarrage complet de la session (recréation du socket)
+    if (isRestartRequired(err)) {
+      app.log.warn({ msg: 'restart required (515) — restarting socket', id: s.id })
+      await restartSession(s.id)
+      return
+    }
+
+    // (B) Déconnexion définitive (logged out) => il faudra rescanner
+    const code = Number(err?.output?.statusCode ?? err?.status ?? err?.code)
+    if (code === DisconnectReason.loggedOut) {
+      s.connected = false
+      app.log.warn({ msg: 'logged out — rescan required', id: s.id })
+      return
+    }
+
+    // (C) Autres cas : Baileys tentera de se reconnecter tout seul
+    s.connected = false
+  }
+}
+
+/** ------------- lifecycle ------------- */
+
 async function restartSession(id: string) {
   const s = sessions.get(id)
   if (!s) return
@@ -72,7 +122,7 @@ async function restartSession(id: string) {
   s.qr = null
   s.qr_text = null
 
-  // Recrée un nouveau socket avec le même répertoire d’auth
+  // Recréer le socket sur le même répertoire d’auth
   const { state, saveCreds } = await useMultiFileAuthState(path.join(AUTH_DIR, id))
   const { version } = await fetchLatestBaileysVersion()
 
@@ -87,7 +137,6 @@ async function restartSession(id: string) {
   })
   s.sock = sock
 
-  // Rebranche tous les listeners (même logique que dans startSession)
   sock.ev.on('creds.update', saveCreds)
   sock.ev.on('connection.update', async (u) => onConnectionUpdate(s, u))
 }
@@ -110,39 +159,13 @@ async function startSession(id: string) {
   sessions.set(id, s)
 
   sock.ev.on('creds.update', saveCreds)
-
-  sock.ev.on('connection.update', async (u) => {
-    // Logs utiles sur Render
-    app.log.info({ wa_update: { conn: u.connection, hasQR: !!u.qr, disc: !!u.lastDisconnect } })
-
-    if (u.qr) {
-      s.qr_text = u.qr
-      try {
-        s.qr = await QRCode.toDataURL(u.qr)
-      } catch (e) {
-        s.qr = null
-        app.log.warn({ msg: 'qr toDataURL failed', err: String(e) })
-      }
-    }
-
-    if (u.connection === 'open') {
-      s.connected = true
-      s.qr = null
-      s.qr_text = null
-    }
-
-    if (u.connection === 'close') {
-      const code = (u.lastDisconnect?.error as any)?.output?.statusCode
-      const shouldReconnect = code !== DisconnectReason.loggedOut
-      s.connected = false
-      if (shouldReconnect) {
-        // Reconnexion auto gérée par Baileys
-      }
-    }
-  })
+  // 🔧 NOUVEAU: un seul handler centralisé
+  sock.ev.on('connection.update', async (u) => onConnectionUpdate(s, u))
 
   return s
 }
+
+/** ------------- API ------------- */
 
 app.post('/sessions', async (_req, reply) => {
   const id = uuid()
@@ -157,6 +180,15 @@ app.get('/sessions/:id', async (req, reply) => {
   const s = sessions.get(id)
   if (!s) return reply.code(404).send({ error: 'unknown session' })
   return reply.send({ session_id: id, connected: s.connected, qr: s.qr || null, qr_text: s.qr_text || null })
+})
+
+// Optionnel: forcer un redémarrage manuel si besoin
+app.post('/sessions/:id/restart', async (req, reply) => {
+  const id = (req.params as any).id
+  const s = sessions.get(id)
+  if (!s) return reply.code(404).send({ error: 'unknown session' })
+  await restartSession(id)
+  return reply.send({ ok: true })
 })
 
 app.post('/messages', async (req, reply) => {
