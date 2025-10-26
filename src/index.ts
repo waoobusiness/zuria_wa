@@ -1,8 +1,8 @@
 // src/index.ts
 
-// -------------------------
+// -------------------------------------------------
 // IMPORTS
-// -------------------------
+// -------------------------------------------------
 import Fastify from 'fastify'
 import fastifyStatic from '@fastify/static'
 import cors from '@fastify/cors'
@@ -21,25 +21,22 @@ import fs from 'fs'
 import path from 'path'
 
 
-// -------------------------
+// -------------------------------------------------
 // CONFIG (variables d'environnement Render)
-// -------------------------
+// -------------------------------------------------
 
 // Port HTTP du serveur Fastify
 const PORT = parseInt(process.env.PORT || '3001', 10)
 
-// Dossier persistant monté sur Render (disque).
-// Là-dedans on met la sous-dossier de chaque session: /var/data/wa/<sessionId>/*
+// Dossier persistant monté sur Render (disque)
+// Là-dedans on met la sous-dossier de chaque session: <AUTH_DIR>/<sessionId>/*
 const AUTH_DIR = process.env.AUTH_DIR || './.wa'
 
 // Dossier où on sauvegarde les médias reçus (images, audio, etc.)
-// Par défaut on fait "<AUTH_DIR>/media"
-const MEDIA_DIR =
-  process.env.MEDIA_DIR || path.join(AUTH_DIR, 'media')
+const MEDIA_DIR = process.env.MEDIA_DIR || path.join(AUTH_DIR, 'media')
 
 // URL publique de ton service Baileys (celle de Render)
 // Sert à générer des liens publics vers les médias
-// ex: https://zuria-wa.onrender.com
 const PUBLIC_BASE_URL =
   process.env.PUBLIC_BASE_URL || 'https://zuria-wa.onrender.com'
 
@@ -47,58 +44,58 @@ const PUBLIC_BASE_URL =
 // (header x-wa-signature)
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || ''
 
-// Clé d'API optionnelle pour protéger l'endpoint POST /messages
-// => le front doit envoyer le header:  x-api-key: <API_KEY>
+// Clé d'API optionnelle pour protéger certains endpoints (POST /messages, etc.)
+// => le front doit envoyer le header: x-api-key: <API_KEY>
 const API_KEY = process.env.API_KEY || ''
 
 
-// -------------------------
+// -------------------------------------------------
 // TYPES & MÉMOIRE
-// -------------------------
+// -------------------------------------------------
 
 type SessionState = {
   id: string
 
   // QR code pour affichage dans l'UI :
   // - qr : data:image/png;base64,...
-  // - qr_text : texte brut du QR (fallback)
+  // - qr_text : texte brut du QR (fallback texte du QR)
   qr?: string | null
   qr_text?: string | null
 
-  // état
+  // état connexion WA
   connected: boolean
 
-  // socket Baileys
+  // socket Baileys courant
   sock?: ReturnType<typeof makeWASocket>
 
-  // petit "store" mémoire Baileys (chats, etc.)
+  // store mémoire Baileys (liste des chats, etc.)
   store?: ReturnType<typeof makeInMemoryStore>
 
-  // pour sauvegarder les credentials
+  // fonction fournie par Baileys pour persister les credentials multi-fichiers
   saveCreds?: () => Promise<void>
 
-  // webhook Zuria/Lovable
+  // webhook enregistré par Zuria/Lovable pour CETTE session
   webhookUrl?: string
-  webhookSecret?: string
+  webhookSecret?: string // peut override WEBHOOK_SECRET global
 
-  // infos du compte WhatsApp connecté
+  // infos sur le compte WhatsApp connecté
   meId?: string | null        // ex "4176xxxxxx:29@s.whatsapp.net"
   meNumber?: string | null    // juste les chiffres
-  phoneNumber?: string | null // alias
+  phoneNumber?: string | null // alias pratique (= meNumber)
 }
 
 // toutes les sessions vivantes (en RAM côté serveur)
 const sessions = new Map<string, SessionState>()
 
 
-// -------------------------
-// FASTIFY BOOT
-// -------------------------
+// -------------------------------------------------
+/* FASTIFY BOOT */
+// -------------------------------------------------
 
 const app = Fastify({ logger: true })
 await app.register(cors, { origin: true })
 
-// on s'assure que le dossier média existe
+// s'assurer que le dossier média existe
 fs.mkdirSync(MEDIA_DIR, { recursive: true })
 
 // servir les médias statiquement à /media/<fichier>
@@ -108,12 +105,12 @@ await app.register(fastifyStatic, {
 })
 
 
-// -------------------------
+// -------------------------------------------------
 // HELPERS
-// -------------------------
+// -------------------------------------------------
 
-// Ex: "41766085008@s.whatsapp.net"  -> "41766085008"
-//     "41766085008:29@s.whatsapp.net" -> "41766085008"
+// "41766085008@s.whatsapp.net"  -> "41766085008"
+// "41766085008:29@s.whatsapp.net" -> "41766085008"
 function extractPhoneFromJid(jid?: string | null): string | null {
   if (!jid) return null
   // on prend uniquement les premiers chiffres avant ":" ou "@"
@@ -137,34 +134,28 @@ function guessExt(mime: string | undefined): string {
   return 'bin'
 }
 
-// Transforme un message Baileys brut en format simple pour le front/chat UI
+// Transforme un message Baileys brut en format simple pour le front
 function simplifyBaileysMessage(m: any) {
   const fromMe = m.key?.fromMe === true
 
   const text =
-      m.message?.conversation
-   || m.message?.extendedTextMessage?.text
-   || m.message?.imageMessage?.caption
-   || m.message?.videoMessage?.caption
-   || m.message?.documentMessage?.caption
-   || ''
+    m.message?.conversation ||
+    m.message?.extendedTextMessage?.text ||
+    m.message?.imageMessage?.caption ||
+    m.message?.videoMessage?.caption ||
+    m.message?.documentMessage?.caption ||
+    ''
 
   const messageId = m.key?.id || ''
-
-  // Baileys renvoie souvent un timestamp en secondes.
-  // On essaie plusieurs endroits possibles.
-  const tsSec =
-    Number(m.messageTimestamp ?? 0) ||
-    Number(m.message?.timestamp ?? 0) ||
-    0
+  const tsMs = Number(m.messageTimestamp || 0) * 1000
 
   return {
     messageId,
     fromMe,
     text,
-    mediaUrl: null,   // pas de téléchargement des médias dans la pagination
+    mediaUrl: null,   // pour la pagination historique on ne retélécharge pas le binaire
     mediaMime: null,
-    timestampMs: tsSec * 1000,
+    timestampMs: tsMs,
   }
 }
 
@@ -175,7 +166,13 @@ async function saveIncomingMedia(
 ): Promise<null | { filename: string; mimeType: string; url: string }> {
   // On cherche si ce message contient un média supporté
   // On traite en priorité image/video/audio/document/sticker
-  let mediaType: 'image' | 'video' | 'audio' | 'document' | 'sticker' | null = null
+  let mediaType:
+    | 'image'
+    | 'video'
+    | 'audio'
+    | 'document'
+    | 'sticker'
+    | null = null
   let mediaObj: any = null
 
   if (msg.message?.imageMessage) {
@@ -208,9 +205,12 @@ async function saveIncomingMedia(
   const buf = Buffer.concat(chunks)
 
   // Construire un nom de fichier unique
-  const mimeType = mediaObj.mimetype || mediaObj.mimetype || 'application/octet-stream'
+  const mimeType =
+    mediaObj.mimetype || mediaObj.mimetype || 'application/octet-stream'
   const ext = guessExt(mimeType)
-  const filename = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`
+  const filename = `${Date.now()}-${Math.random()
+    .toString(36)
+    .slice(2, 8)}.${ext}`
   const absPath = path.join(MEDIA_DIR, filename)
 
   fs.writeFileSync(absPath, buf)
@@ -226,10 +226,10 @@ async function saveIncomingMedia(
   }
 }
 
-// envoi d'un event webhook vers Zuria / Lovable
-// - s : la session
-// - event : ex "message.in", "session.connected"
-// - payload : { data: {...}, ts: Date.now(), ... }
+// Envoi d'un event webhook vers Zuria / Lovable
+// - s        : la session
+// - event    : ex "message.in", "session.connected"
+// - payload  : { data: {...}, ts: Date.now(), ... }
 async function sendWebhookEvent(
   s: SessionState,
   event: string,
@@ -286,18 +286,18 @@ async function sendWebhookEvent(
 function isRestartRequired(err: any) {
   const code = Number(
     err?.output?.statusCode ??
-    err?.status ??
-    err?.code ??
-    err?.statusCode ??
-    0
+      err?.status ??
+      err?.code ??
+      err?.statusCode ??
+      0
   )
   return code === 515 || code === DisconnectReason.restartRequired
 }
 
 
-// -------------------------
+// -------------------------------------------------
 // HANDLERS BAILEYS
-// -------------------------
+// -------------------------------------------------
 
 // Gestion des updates de connexion (QR, connecté/déconnecté, etc.)
 async function onConnectionUpdate(s: SessionState, u: any) {
@@ -329,7 +329,7 @@ async function onConnectionUpdate(s: SessionState, u: any) {
 
     // on essaie d'extraire le numéro du compte WhatsApp lié
     // Baileys renvoie souvent "me" ou "user" dans l'update
-    // par ex u.me.id = "4176XXXXXX:29@s.whatsapp.net"
+    // ex u.me.id = "4176XXXXXX:29@s.whatsapp.net"
     if (u.me?.id) {
       s.meId = u.me.id || null
       // on garde juste les chiffres avant ":" ou "@"
@@ -338,7 +338,7 @@ async function onConnectionUpdate(s: SessionState, u: any) {
       s.phoneNumber = s.meNumber || null
     }
 
-    // prévenir la plateforme (Lovable)
+    // prévenir la plateforme (Lovable / Zuria)
     await sendWebhookEvent(s, 'session.connected', {
       data: {
         meId: s.meId || null,
@@ -367,10 +367,10 @@ async function onConnectionUpdate(s: SessionState, u: any) {
     // Cas B : vraiment déconnecté / logged out => il faudra rescanner
     const code = Number(
       err?.output?.statusCode ??
-      err?.status ??
-      err?.code ??
-      err?.statusCode ??
-      0
+        err?.status ??
+        err?.code ??
+        err?.statusCode ??
+        0
     )
     if (code === DisconnectReason.loggedOut) {
       s.connected = false
@@ -415,12 +415,12 @@ async function onMessagesUpsert(s: SessionState, m: any) {
   // Si c'est un message média -> on sauvegarde le fichier
   const mediaInfo = await saveIncomingMedia(msg) // peut être null
 
-  // On envoie l'event "message.in" au webhook
+  // On envoie l'event "message.in" au webhook Zuria/Lovable
   await sendWebhookEvent(s, 'message.in', {
     data: {
       from: chatNumber || remoteJid,
       fromJid: remoteJid,
-      fromMe,            // <---- super important pour savoir si c'est agent ou client
+      fromMe,            // super important pour savoir si c'est agent ou client
       text,
       media: mediaInfo,  // { url, mimeType, filename } | null
     },
@@ -428,9 +428,12 @@ async function onMessagesUpsert(s: SessionState, m: any) {
   })
 }
 
-// Associe tous les listeners nécessaires à un socket Baileys
-function attachSocketHandlers(s: SessionState, sock: ReturnType<typeof makeWASocket>) {
-  // sauve les crédos quand ils changent
+// attache les listeners nécessaires à un socket Baileys
+function attachSocketHandlers(
+  s: SessionState,
+  sock: ReturnType<typeof makeWASocket>
+) {
+  // sauvegarde des credentials quand ils changent
   if (s.saveCreds) {
     sock.ev.on('creds.update', s.saveCreds)
   }
@@ -443,9 +446,9 @@ function attachSocketHandlers(s: SessionState, sock: ReturnType<typeof makeWASoc
 }
 
 
-// -------------------------
+// -------------------------------------------------
 // CYCLE DE VIE D'UNE SESSION
-// -------------------------
+// -------------------------------------------------
 
 // (ré)initialise le socket pour une session existante
 async function restartSession(id: string) {
@@ -533,16 +536,16 @@ async function startSession(id: string) {
   // 6. garder la session
   sessions.set(id, s)
 
-  // 7. brancher les listeners (connection.update, messages.upsert, etc.)
+  // 7. brancher les listeners
   attachSocketHandlers(s, sock)
 
   return s
 }
 
 
-// -------------------------
+// -------------------------------------------------
 // ROUTES HTTP
-// -------------------------
+// -------------------------------------------------
 
 // Page simple pour créer une session manuellement + voir QR
 app.get('/', async (_req, reply) => {
@@ -597,7 +600,7 @@ app.get('/', async (_req, reply) => {
 })
 
 
-// Mini console d’envoi de message pour test humain
+// Mini console d’envoi de message pour test humain (debug)
 app.get('/send', async (_req, reply) => {
   const html = `
   <html>
@@ -672,7 +675,7 @@ app.post('/sessions', async (_req, reply) => {
   app.log.info({ msg: 'create session', id })
   const s = await startSession(id)
   // on laisse 500ms à Baileys pour éventuellement déjà générer un QR
-  await new Promise(res => setTimeout(res, 500))
+  await new Promise((res) => setTimeout(res, 500))
   return reply.send({ session_id: s.id })
 })
 
@@ -789,11 +792,11 @@ app.get('/sessions/:id/chats', async (req, reply) => {
   const limit = Math.min(Number(q.limit || 20), 50)
   const beforeTs = Number(q.beforeTs || 0) // ms
 
-  // Récupérer la liste brute des chats depuis le store
+  // Récupérer la liste brute des chats depuis le store mémoire de Baileys
   let rawChats: any[] = []
   if (s.store && (s.store as any).chats) {
     const ch: any = (s.store as any).chats
-    // essaie différents formats possibles (Map vs Array)
+    // selon la version, chats peut être une Map, ou un objet spécial
     if (typeof ch.values === 'function') {
       rawChats = Array.from(ch.values())
     } else if (ch instanceof Map) {
@@ -812,7 +815,10 @@ app.get('/sessions/:id/chats', async (req, reply) => {
 
   // si beforeTs est fourni, on ne prend que les plus anciens que ce curseur
   const filtered = beforeTs > 0
-    ? sorted.filter((c: any) => Number(c.conversationTimestamp || 0) * 1000 < beforeTs)
+    ? sorted.filter(
+        (c: any) =>
+          Number(c.conversationTimestamp || 0) * 1000 < beforeTs
+      )
     : sorted
 
   // on coupe au "limit"
@@ -826,9 +832,12 @@ app.get('/sessions/:id/chats', async (req, reply) => {
   }))
 
   // curseur pour récupérer la page suivante
-  const nextBeforeTs = page.length > 0
-    ? Number(page[page.length - 1].conversationTimestamp || 0) * 1000
-    : null
+  const nextBeforeTs =
+    page.length > 0
+      ? Number(
+          page[page.length - 1].conversationTimestamp || 0
+        ) * 1000
+      : null
 
   return reply.send({
     ok: true,
@@ -871,9 +880,10 @@ app.get('/sessions/:id/chats/:jid/messages', async (req, reply) => {
   }
 
   // Baileys attend un "cursor" facultatif { id, fromMe, remoteJid }
-  const cursor = (beforeId && typeof beforeFromMe === 'boolean')
-    ? { id: beforeId, fromMe: beforeFromMe, remoteJid: jid }
-    : undefined
+  const cursor =
+    beforeId && typeof beforeFromMe === 'boolean'
+      ? { id: beforeId, fromMe: beforeFromMe, remoteJid: jid }
+      : undefined
 
   let rawMsgs: any[] = []
   try {
@@ -908,9 +918,9 @@ app.get('/health', async (_req, reply) => {
 })
 
 
-// -------------------------
+// -------------------------------------------------
 // START HTTP SERVER
-// -------------------------
+// -------------------------------------------------
 app.listen({ port: PORT, host: '0.0.0.0' }).then(() => {
   app.log.info(`HTTP server listening on ${PORT}`)
 })
