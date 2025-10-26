@@ -14,6 +14,7 @@ import makeWASocket, {
   DisconnectReason,
   fetchLatestBaileysVersion,
   downloadContentFromMessage,
+  makeInMemoryStore,
 } from '@whiskeysockets/baileys'
 
 import fs from 'fs'
@@ -60,28 +61,29 @@ type SessionState = {
   // QR code pour affichage dans l'UI :
   // - qr : data:image/png;base64,...
   // - qr_text : texte brut du QR (fallback)
-  qr?: string | null
+   qr?: string | null
   qr_text?: string | null
 
-  // est-ce que la session est connectée à WhatsApp ?
+  // état
   connected: boolean
 
-  // socket Baileys courant
+  // socket Baileys
   sock?: ReturnType<typeof makeWASocket>
 
-  // fonction Baileys pour sauvegarder les credentials multi-fichiers
+  // petit "store" mémoire Baileys (chats, etc.)
+  store?: ReturnType<typeof makeInMemoryStore>
+
+  // pour sauvegarder les credentials
   saveCreds?: () => Promise<void>
 
-  // webhook enregistré par Zuria/Lovable pour cette session
+  // webhook Zuria/Lovable
   webhookUrl?: string
-  webhookSecret?: string // peut overrider WEBHOOK_SECRET global si fourni
+  webhookSecret?: string
 
-  // infos sur le compte WhatsApp connecté
+  // infos du compte WhatsApp connecté
   meId?: string | null        // ex "4176xxxxxx:29@s.whatsapp.net"
-  meNumber?: string | null    // ex "4176xxxxxx" (juste les chiffres)
-
-  // alias pratique (= meNumber), utile côté UI
-  phoneNumber?: string | null
+  meNumber?: string | null    // juste les chiffres
+  phoneNumber?: string | null // alias
 }
 
 // toutes les sessions vivantes (en RAM côté serveur)
@@ -164,6 +166,31 @@ async function saveIncomingMedia(
   if (!mediaType || !mediaObj) {
     return null // pas de média
   }
+  // Transforme un message Baileys brut en format simple pour le front
+function simplifyBaileysMessage(m: any) {
+  const fromMe = m.key?.fromMe === true
+
+  const text =
+      m.message?.conversation
+   || m.message?.extendedTextMessage?.text
+   || m.message?.imageMessage?.caption
+   || m.message?.videoMessage?.caption
+   || m.message?.documentMessage?.caption
+   || ''
+
+  const messageId = m.key?.id || ''
+  const tsMs = Number(m.messageTimestamp || 0) * 1000
+
+  return {
+    messageId,
+    fromMe,
+    text,
+    mediaUrl: null,   // on ne retélécharge pas le binaire dans la pagination
+    mediaMime: null,
+    timestampMs: tsMs,
+  }
+}
+
 
   // Récupérer le flux binaire via Baileys
   const stream = await downloadContentFromMessage(mediaObj, mediaType)
@@ -428,7 +455,7 @@ async function restartSession(id: string) {
   s.qr = null
   s.qr_text = null
 
-  // on recharge l'état d'auth depuis le disque
+  // recharger l'état d'auth depuis le disque
   const { state, saveCreds } = await useMultiFileAuthState(
     path.join(AUTH_DIR, id)
   )
@@ -436,6 +463,7 @@ async function restartSession(id: string) {
 
   s.saveCreds = saveCreds
 
+  // créer nouveau socket
   const sock = makeWASocket({
     version,
     auth: state,
@@ -444,18 +472,24 @@ async function restartSession(id: string) {
     connectTimeoutMs: 60_000,
     defaultQueryTimeoutMs: 60_000,
   })
-
   s.sock = sock
 
+  // créer un store mémoire et le binder au socket
+  const store = makeInMemoryStore({})
+  store.bind(sock.ev)
+  s.store = store
+
+  // rebrancher les listeners
   attachSocketHandlers(s, sock)
 }
 
+
 // crée une NOUVELLE session
 async function startSession(id: string) {
-  // 1. on s'assure que le dossier d'auth existe
+  // 1. s'assure que le dossier d'auth existe
   fs.mkdirSync(path.join(AUTH_DIR, id), { recursive: true })
 
-  // 2. state Baileys multi-fichiers
+  // 2. récupère l'état multi-fichiers Baileys
   const { state, saveCreds } = await useMultiFileAuthState(
     path.join(AUTH_DIR, id)
   )
@@ -482,13 +516,17 @@ async function startSession(id: string) {
     connectTimeoutMs: 60_000,
     defaultQueryTimeoutMs: 60_000,
   })
-
   s.sock = sock
 
-  // 5. garder la session
+  // 5. créer le store mémoire et le binder
+  const store = makeInMemoryStore({})
+  store.bind(sock.ev)
+  s.store = store
+
+  // 6. garder la session
   sessions.set(id, s)
 
-  // 6. brancher les listeners
+  // 7. brancher les listeners (connection.update, messages.upsert, etc.)
   attachSocketHandlers(s, sock)
 
   return s
@@ -720,6 +758,138 @@ app.post('/messages', async (req, reply) => {
   })
 
   return reply.send({ ok: true })
+})
+
+// Liste paginée des conversations (chats)
+// GET /sessions/:id/chats?limit=20&beforeTs=1730000000000
+// - limit: max 50 (défaut 20)
+// - beforeTs: timestamp ms -> on veut SEULEMENT les chats plus anciens que ça
+app.get('/sessions/:id/chats', async (req, reply) => {
+  const id = (req.params as any).id
+  const s = sessions.get(id)
+  if (!s?.sock) return reply.code(400).send({ error: 'session not ready' })
+
+  // sécurité API_KEY identique à /messages
+  if (API_KEY) {
+    const hdr = req.headers['x-api-key']
+    if (!hdr || hdr !== API_KEY) {
+      return reply.code(401).send({ error: 'unauthorized' })
+    }
+  }
+
+  const q = (req.query as any) || {}
+  const limit = Math.min(Number(q.limit || 20), 50)
+  const beforeTs = Number(q.beforeTs || 0) // ms
+
+  // Récupérer la liste brute des chats depuis le store
+  let rawChats: any[] = []
+  if (s.store && (s.store as any).chats) {
+    const ch: any = (s.store as any).chats
+    // essaie différents formats possibles (Map vs Array)
+    if (typeof ch.values === 'function') {
+      rawChats = Array.from(ch.values())
+    } else if (ch instanceof Map) {
+      rawChats = Array.from(ch.values())
+    } else if (Array.isArray(ch)) {
+      rawChats = ch
+    }
+  }
+
+  // trier du plus récent au plus ancien
+  const sorted = rawChats.sort((a: any, b: any) => {
+    const ta = Number(a.conversationTimestamp || 0)
+    const tb = Number(b.conversationTimestamp || 0)
+    return tb - ta
+  })
+
+  // si beforeTs est fourni, on ne prend que les plus anciens que ce curseur
+  const filtered = beforeTs > 0
+    ? sorted.filter((c: any) => Number(c.conversationTimestamp || 0) * 1000 < beforeTs)
+    : sorted
+
+  // on coupe au "limit"
+  const page = filtered.slice(0, limit)
+
+  const chats = page.map((chat: any) => ({
+    chatJid: chat.id,
+    chatNumber: extractPhoneFromJid(chat.id),
+    chatName: chat.name || chat.subject || null,
+    lastTsMs: Number(chat.conversationTimestamp || 0) * 1000,
+  }))
+
+  // curseur pour récupérer la page suivante
+  const nextBeforeTs = page.length > 0
+    ? Number(page[page.length - 1].conversationTimestamp || 0) * 1000
+    : null
+
+  return reply.send({
+    ok: true,
+    chats,
+    nextBeforeTs, // le front doit renvoyer ça dans ?beforeTs=... pour "voir plus"
+  })
+})
+
+// Messages paginés d'une conversation
+// GET /sessions/:id/chats/:jid/messages?limit=20&beforeId=AAAA&beforeFromMe=false
+//
+// - limit: max 50 (défaut 20)
+// - beforeId & beforeFromMe : servent de curseur pour demander plus ancien
+//   (le front les récupère dans nextCursor)
+app.get('/sessions/:id/chats/:jid/messages', async (req, reply) => {
+  const { id, jid } = (req.params as any)
+  const s = sessions.get(id)
+  if (!s?.sock) {
+    return reply.code(400).send({ error: 'session not ready' })
+  }
+
+  if (API_KEY) {
+    const hdr = req.headers['x-api-key']
+    if (!hdr || hdr !== API_KEY) {
+      return reply.code(401).send({ error: 'unauthorized' })
+    }
+  }
+
+  const q = (req.query as any) || {}
+  const limit = Math.min(Number(q.limit || 20), 50)
+
+  // curseur de pagination
+  const beforeId = q.beforeId ? String(q.beforeId) : undefined
+  let beforeFromMe: boolean | undefined = undefined
+  if (q.beforeFromMe === 'true' || q.beforeFromMe === true) {
+    beforeFromMe = true
+  } else if (q.beforeFromMe === 'false' || q.beforeFromMe === false) {
+    beforeFromMe = false
+  }
+
+  // Baileys attend un "cursor" facultatif { id, fromMe, remoteJid }
+  const cursor = (beforeId && typeof beforeFromMe === 'boolean')
+    ? { id: beforeId, fromMe: beforeFromMe, remoteJid: jid }
+    : undefined
+
+  let rawMsgs: any[] = []
+  try {
+    // charge les messages du plus récent vers le plus ancien
+    rawMsgs = await (s.sock as any).loadMessages(jid, limit, cursor)
+  } catch (e: any) {
+    return reply.code(500).send({
+      error: 'loadMessages failed',
+      detail: String(e),
+    })
+  }
+
+  const messages = rawMsgs.map(simplifyBaileysMessage)
+
+  // prépare le curseur pour "page suivante" = le dernier (donc le plus ancien) de cette page
+  const last = messages[messages.length - 1]
+  const nextCursor = last
+    ? { beforeId: last.messageId, beforeFromMe: last.fromMe }
+    : null
+
+  return reply.send({
+    ok: true,
+    messages,
+    nextCursor, // le front renverra ça pour charger encore plus vieux
+  })
 })
 
 
