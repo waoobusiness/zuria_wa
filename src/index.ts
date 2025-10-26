@@ -1,8 +1,8 @@
 // src/index.ts
 
-// -------------------------------------------------
+// -------------------------
 // IMPORTS
-// -------------------------------------------------
+// -------------------------
 import Fastify from 'fastify'
 import fastifyStatic from '@fastify/static'
 import cors from '@fastify/cors'
@@ -21,37 +21,36 @@ import fs from 'fs'
 import path from 'path'
 
 
-// -------------------------------------------------
+// -------------------------
 // CONFIG (variables d'environnement Render)
-// -------------------------------------------------
+// -------------------------
 
 // Port HTTP du serveur Fastify
 const PORT = parseInt(process.env.PORT || '3001', 10)
 
-// Dossier persistant monté sur Render (disque)
+// Dossier persistant monté sur Render (disque).
 // Là-dedans on met la sous-dossier de chaque session: <AUTH_DIR>/<sessionId>/*
 const AUTH_DIR = process.env.AUTH_DIR || './.wa'
 
 // Dossier où on sauvegarde les médias reçus (images, audio, etc.)
-const MEDIA_DIR = process.env.MEDIA_DIR || path.join(AUTH_DIR, 'media')
+const MEDIA_DIR =
+  process.env.MEDIA_DIR || path.join(AUTH_DIR, 'media')
 
-// URL publique de ton service Baileys (celle de Render)
-// Sert à générer des liens publics vers les médias
+// URL publique du service (utilisée pour générer des URLs publiques vers les médias)
 const PUBLIC_BASE_URL =
   process.env.PUBLIC_BASE_URL || 'https://zuria-wa.onrender.com'
 
-// Secret global utilisé pour signer les webhooks sortants
-// (header x-wa-signature)
+// Secret global pour signer les webhooks sortants (header x-wa-signature)
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || ''
 
-// Clé d'API optionnelle pour protéger certains endpoints (POST /messages, etc.)
-// => le front doit envoyer le header: x-api-key: <API_KEY>
+// Clé d'API optionnelle pour protéger certains endpoints (/messages, /chats, etc.)
+// Le front doit envoyer le header:  x-api-key: <API_KEY>
 const API_KEY = process.env.API_KEY || ''
 
 
-// -------------------------------------------------
+// -------------------------
 // TYPES & MÉMOIRE
-// -------------------------------------------------
+// -------------------------
 
 type SessionState = {
   id: string
@@ -76,7 +75,7 @@ type SessionState = {
 
   // webhook enregistré par Zuria/Lovable pour CETTE session
   webhookUrl?: string
-  webhookSecret?: string // peut override WEBHOOK_SECRET global
+  webhookSecret?: string
 
   // infos sur le compte WhatsApp connecté
   meId?: string | null        // ex "4176xxxxxx:29@s.whatsapp.net"
@@ -88,9 +87,9 @@ type SessionState = {
 const sessions = new Map<string, SessionState>()
 
 
-// -------------------------------------------------
-/* FASTIFY BOOT */
-// -------------------------------------------------
+// -------------------------
+// FASTIFY BOOT
+// -------------------------
 
 const app = Fastify({ logger: true })
 await app.register(cors, { origin: true })
@@ -105,11 +104,11 @@ await app.register(fastifyStatic, {
 })
 
 
-// -------------------------------------------------
+// -------------------------
 // HELPERS
-// -------------------------------------------------
+// -------------------------
 
-// "41766085008@s.whatsapp.net"  -> "41766085008"
+// "41766085008@s.whatsapp.net" -> "41766085008"
 // "41766085008:29@s.whatsapp.net" -> "41766085008"
 function extractPhoneFromJid(jid?: string | null): string | null {
   if (!jid) return null
@@ -132,31 +131,6 @@ function guessExt(mime: string | undefined): string {
   if (mime.includes('opus')) return 'ogg'
   if (mime.includes('pdf')) return 'pdf'
   return 'bin'
-}
-
-// Transforme un message Baileys brut en format simple pour le front
-function simplifyBaileysMessage(m: any) {
-  const fromMe = m.key?.fromMe === true
-
-  const text =
-    m.message?.conversation ||
-    m.message?.extendedTextMessage?.text ||
-    m.message?.imageMessage?.caption ||
-    m.message?.videoMessage?.caption ||
-    m.message?.documentMessage?.caption ||
-    ''
-
-  const messageId = m.key?.id || ''
-  const tsMs = Number(m.messageTimestamp || 0) * 1000
-
-  return {
-    messageId,
-    fromMe,
-    text,
-    mediaUrl: null,   // pour la pagination historique on ne retélécharge pas le binaire
-    mediaMime: null,
-    timestampMs: tsMs,
-  }
 }
 
 // Télécharge un média (image, audio, etc.) depuis un message Baileys,
@@ -226,10 +200,38 @@ async function saveIncomingMedia(
   }
 }
 
+// Transforme un message Baileys brut en format simple pour le front/chat UI
+function simplifyBaileysMessage(m: any) {
+  const fromMe = m.key?.fromMe === true
+
+  const text =
+    m.message?.conversation ||
+    m.message?.extendedTextMessage?.text ||
+    m.message?.imageMessage?.caption ||
+    m.message?.videoMessage?.caption ||
+    m.message?.documentMessage?.caption ||
+    ''
+
+  const messageId = m.key?.id || ''
+
+  // Baileys renvoie souvent un timestamp en secondes.
+  // On convertit en ms.
+  const tsMs = Number(m.messageTimestamp ?? 0) * 1000
+
+  return {
+    messageId,
+    fromMe,
+    text,
+    mediaUrl: null, // on ne retélécharge pas le binaire dans la pagination
+    mediaMime: null,
+    timestampMs: tsMs,
+  }
+}
+
 // Envoi d'un event webhook vers Zuria / Lovable
-// - s        : la session
-// - event    : ex "message.in", "session.connected"
-// - payload  : { data: {...}, ts: Date.now(), ... }
+// - s : la session
+// - event : ex "message.in", "session.connected"
+// - payload : { data: {...}, ts: Date.now(), ... }
 async function sendWebhookEvent(
   s: SessionState,
   event: string,
@@ -295,9 +297,9 @@ function isRestartRequired(err: any) {
 }
 
 
-// -------------------------------------------------
+// -------------------------
 // HANDLERS BAILEYS
-// -------------------------------------------------
+// -------------------------
 
 // Gestion des updates de connexion (QR, connecté/déconnecté, etc.)
 async function onConnectionUpdate(s: SessionState, u: any) {
@@ -329,7 +331,7 @@ async function onConnectionUpdate(s: SessionState, u: any) {
 
     // on essaie d'extraire le numéro du compte WhatsApp lié
     // Baileys renvoie souvent "me" ou "user" dans l'update
-    // ex u.me.id = "4176XXXXXX:29@s.whatsapp.net"
+    // par ex u.me.id = "4176XXXXXX:29@s.whatsapp.net"
     if (u.me?.id) {
       s.meId = u.me.id || null
       // on garde juste les chiffres avant ":" ou "@"
@@ -338,7 +340,7 @@ async function onConnectionUpdate(s: SessionState, u: any) {
       s.phoneNumber = s.meNumber || null
     }
 
-    // prévenir la plateforme (Lovable / Zuria)
+    // prévenir la plateforme (Zuria / Lovable)
     await sendWebhookEvent(s, 'session.connected', {
       data: {
         meId: s.meId || null,
@@ -415,7 +417,7 @@ async function onMessagesUpsert(s: SessionState, m: any) {
   // Si c'est un message média -> on sauvegarde le fichier
   const mediaInfo = await saveIncomingMedia(msg) // peut être null
 
-  // On envoie l'event "message.in" au webhook Zuria/Lovable
+  // On envoie l'event "message.in" au webhook
   await sendWebhookEvent(s, 'message.in', {
     data: {
       from: chatNumber || remoteJid,
@@ -428,12 +430,12 @@ async function onMessagesUpsert(s: SessionState, m: any) {
   })
 }
 
-// attache les listeners nécessaires à un socket Baileys
+// Associe tous les listeners nécessaires à un socket Baileys
 function attachSocketHandlers(
   s: SessionState,
   sock: ReturnType<typeof makeWASocket>
 ) {
-  // sauvegarde des credentials quand ils changent
+  // sauve les crédos quand ils changent
   if (s.saveCreds) {
     sock.ev.on('creds.update', s.saveCreds)
   }
@@ -446,9 +448,9 @@ function attachSocketHandlers(
 }
 
 
-// -------------------------------------------------
+// -------------------------
 // CYCLE DE VIE D'UNE SESSION
-// -------------------------------------------------
+// -------------------------
 
 // (ré)initialise le socket pour une session existante
 async function restartSession(id: string) {
@@ -458,14 +460,18 @@ async function restartSession(id: string) {
   app.log.warn({ msg: 'restart WA session (515)', id })
 
   // nettoyer l'ancien socket
-  try { (s.sock as any)?.ev?.removeAllListeners?.() } catch {}
-  try { (s.sock as any)?.ws?.close?.() } catch {}
+  try {
+    ;(s.sock as any)?.ev?.removeAllListeners?.()
+  } catch {}
+  try {
+    ;(s.sock as any)?.ws?.close?.()
+  } catch {}
   s.sock = undefined
   s.connected = false
   s.qr = null
   s.qr_text = null
 
-  // recharger l'état d'auth depuis le disque
+  // on recharge l'état d'auth depuis le disque
   const { state, saveCreds } = await useMultiFileAuthState(
     path.join(AUTH_DIR, id)
   )
@@ -473,7 +479,6 @@ async function restartSession(id: string) {
 
   s.saveCreds = saveCreds
 
-  // créer nouveau socket
   const sock = makeWASocket({
     version,
     auth: state,
@@ -482,6 +487,7 @@ async function restartSession(id: string) {
     connectTimeoutMs: 60_000,
     defaultQueryTimeoutMs: 60_000,
   })
+
   s.sock = sock
 
   // créer un store mémoire et le binder au socket
@@ -493,13 +499,12 @@ async function restartSession(id: string) {
   attachSocketHandlers(s, sock)
 }
 
-
 // crée une NOUVELLE session
 async function startSession(id: string) {
-  // 1. s'assure que le dossier d'auth existe
+  // 1. on s'assure que le dossier d'auth existe
   fs.mkdirSync(path.join(AUTH_DIR, id), { recursive: true })
 
-  // 2. récupère l'état multi-fichiers Baileys
+  // 2. state Baileys multi-fichiers
   const { state, saveCreds } = await useMultiFileAuthState(
     path.join(AUTH_DIR, id)
   )
@@ -543,9 +548,9 @@ async function startSession(id: string) {
 }
 
 
-// -------------------------------------------------
-// ROUTES HTTP
-// -------------------------------------------------
+// -------------------------
+// ROUTES HTTP (API + petit debug UI)
+// -------------------------
 
 // Page simple pour créer une session manuellement + voir QR
 app.get('/', async (_req, reply) => {
@@ -599,8 +604,7 @@ app.get('/', async (_req, reply) => {
   reply.type('text/html').send(html)
 })
 
-
-// Mini console d’envoi de message pour test humain (debug)
+// Mini console d’envoi de message pour test humain
 app.get('/send', async (_req, reply) => {
   const html = `
   <html>
@@ -675,10 +679,9 @@ app.post('/sessions', async (_req, reply) => {
   app.log.info({ msg: 'create session', id })
   const s = await startSession(id)
   // on laisse 500ms à Baileys pour éventuellement déjà générer un QR
-  await new Promise((res) => setTimeout(res, 500))
+  await new Promise(res => setTimeout(res, 500))
   return reply.send({ session_id: s.id })
 })
-
 
 // Récupérer l'état d'une session
 app.get('/sessions/:id', async (req, reply) => {
@@ -698,7 +701,6 @@ app.get('/sessions/:id', async (req, reply) => {
   })
 })
 
-
 // Redémarrer manuellement une session (utile si plantage)
 app.post('/sessions/:id/restart', async (req, reply) => {
   const id = (req.params as any).id
@@ -708,7 +710,6 @@ app.post('/sessions/:id/restart', async (req, reply) => {
   await restartSession(id)
   return reply.send({ ok: true })
 })
-
 
 // Enregistrer / mettre à jour le webhook pour une session
 // Body attendu:
@@ -736,14 +737,13 @@ app.post('/sessions/:id/webhook', async (req, reply) => {
   })
 })
 
-
 // Envoyer un message sortant
 // Body attendu:
 // { "sessionId": "...", "to": "4176xxxxxxx", "text": "hello" }
 app.post('/messages', async (req, reply) => {
   // auth API_KEY si défini
   if (API_KEY) {
-    const hdr = req.headers['x-api-key']
+    const hdr = (req.headers as any)['x-api-key']
     if (!hdr || hdr !== API_KEY) {
       return reply.code(401).send({ error: 'unauthorized' })
     }
@@ -780,9 +780,9 @@ app.get('/sessions/:id/chats', async (req, reply) => {
   const s = sessions.get(id)
   if (!s?.sock) return reply.code(400).send({ error: 'session not ready' })
 
-  // sécurité API_KEY identique à /messages
+  // sécurité API_KEY comme /messages
   if (API_KEY) {
-    const hdr = req.headers['x-api-key']
+    const hdr = (req.headers as any)['x-api-key']
     if (!hdr || hdr !== API_KEY) {
       return reply.code(401).send({ error: 'unauthorized' })
     }
@@ -792,11 +792,11 @@ app.get('/sessions/:id/chats', async (req, reply) => {
   const limit = Math.min(Number(q.limit || 20), 50)
   const beforeTs = Number(q.beforeTs || 0) // ms
 
-  // Récupérer la liste brute des chats depuis le store mémoire de Baileys
+  // Récupérer la liste brute des chats depuis le store
   let rawChats: any[] = []
   if (s.store && (s.store as any).chats) {
     const ch: any = (s.store as any).chats
-    // selon la version, chats peut être une Map, ou un objet spécial
+    // Baileys peut stocker ça en Map, ou objet similaire
     if (typeof ch.values === 'function') {
       rawChats = Array.from(ch.values())
     } else if (ch instanceof Map) {
@@ -814,12 +814,13 @@ app.get('/sessions/:id/chats', async (req, reply) => {
   })
 
   // si beforeTs est fourni, on ne prend que les plus anciens que ce curseur
-  const filtered = beforeTs > 0
-    ? sorted.filter(
-        (c: any) =>
-          Number(c.conversationTimestamp || 0) * 1000 < beforeTs
-      )
-    : sorted
+  const filtered =
+    beforeTs > 0
+      ? sorted.filter(
+          (c: any) =>
+            Number(c.conversationTimestamp || 0) * 1000 < beforeTs
+        )
+      : sorted
 
   // on coupe au "limit"
   const page = filtered.slice(0, limit)
@@ -834,9 +835,7 @@ app.get('/sessions/:id/chats', async (req, reply) => {
   // curseur pour récupérer la page suivante
   const nextBeforeTs =
     page.length > 0
-      ? Number(
-          page[page.length - 1].conversationTimestamp || 0
-        ) * 1000
+      ? Number(page[page.length - 1].conversationTimestamp || 0) * 1000
       : null
 
   return reply.send({
@@ -861,7 +860,7 @@ app.get('/sessions/:id/chats/:jid/messages', async (req, reply) => {
   }
 
   if (API_KEY) {
-    const hdr = req.headers['x-api-key']
+    const hdr = (req.headers as any)['x-api-key']
     if (!hdr || hdr !== API_KEY) {
       return reply.code(401).send({ error: 'unauthorized' })
     }
@@ -918,9 +917,9 @@ app.get('/health', async (_req, reply) => {
 })
 
 
-// -------------------------------------------------
+// -------------------------
 // START HTTP SERVER
-// -------------------------------------------------
+// -------------------------
 app.listen({ port: PORT, host: '0.0.0.0' }).then(() => {
   app.log.info(`HTTP server listening on ${PORT}`)
 })
