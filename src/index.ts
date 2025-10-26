@@ -20,6 +20,7 @@ import makeWASocket, {
 import fs from 'fs'
 import path from 'path'
 
+
 // -------------------------
 // CONFIG (variables d'environnement Render)
 // -------------------------
@@ -27,7 +28,7 @@ import path from 'path'
 // Port HTTP du serveur Fastify
 const PORT = parseInt(process.env.PORT || '3001', 10)
 
-// Dossier persistant monté sur Render (disque). Chez toi: /var/data/wa
+// Dossier persistant monté sur Render (disque).
 // Là-dedans on met la sous-dossier de chaque session: /var/data/wa/<sessionId>/*
 const AUTH_DIR = process.env.AUTH_DIR || './.wa'
 
@@ -61,7 +62,7 @@ type SessionState = {
   // QR code pour affichage dans l'UI :
   // - qr : data:image/png;base64,...
   // - qr_text : texte brut du QR (fallback)
-   qr?: string | null
+  qr?: string | null
   qr_text?: string | null
 
   // état
@@ -136,6 +137,37 @@ function guessExt(mime: string | undefined): string {
   return 'bin'
 }
 
+// Transforme un message Baileys brut en format simple pour le front/chat UI
+function simplifyBaileysMessage(m: any) {
+  const fromMe = m.key?.fromMe === true
+
+  const text =
+      m.message?.conversation
+   || m.message?.extendedTextMessage?.text
+   || m.message?.imageMessage?.caption
+   || m.message?.videoMessage?.caption
+   || m.message?.documentMessage?.caption
+   || ''
+
+  const messageId = m.key?.id || ''
+
+  // Baileys renvoie souvent un timestamp en secondes.
+  // On essaie plusieurs endroits possibles.
+  const tsSec =
+    Number(m.messageTimestamp ?? 0) ||
+    Number(m.message?.timestamp ?? 0) ||
+    0
+
+  return {
+    messageId,
+    fromMe,
+    text,
+    mediaUrl: null,   // pas de téléchargement des médias dans la pagination
+    mediaMime: null,
+    timestampMs: tsSec * 1000,
+  }
+}
+
 // Télécharge un média (image, audio, etc.) depuis un message Baileys,
 // le stocke dans MEDIA_DIR, puis renvoie { filename, mimeType, url }
 async function saveIncomingMedia(
@@ -166,31 +198,6 @@ async function saveIncomingMedia(
   if (!mediaType || !mediaObj) {
     return null // pas de média
   }
-  // Transforme un message Baileys brut en format simple pour le front
-function simplifyBaileysMessage(m: any) {
-  const fromMe = m.key?.fromMe === true
-
-  const text =
-      m.message?.conversation
-   || m.message?.extendedTextMessage?.text
-   || m.message?.imageMessage?.caption
-   || m.message?.videoMessage?.caption
-   || m.message?.documentMessage?.caption
-   || ''
-
-  const messageId = m.key?.id || ''
-  const tsMs = Number(m.messageTimestamp || 0) * 1000
-
-  return {
-    messageId,
-    fromMe,
-    text,
-    mediaUrl: null,   // on ne retélécharge pas le binaire dans la pagination
-    mediaMime: null,
-    timestampMs: tsMs,
-  }
-}
-
 
   // Récupérer le flux binaire via Baileys
   const stream = await downloadContentFromMessage(mediaObj, mediaType)
@@ -760,6 +767,7 @@ app.post('/messages', async (req, reply) => {
   return reply.send({ ok: true })
 })
 
+
 // Liste paginée des conversations (chats)
 // GET /sessions/:id/chats?limit=20&beforeTs=1730000000000
 // - limit: max 50 (défaut 20)
@@ -828,6 +836,7 @@ app.get('/sessions/:id/chats', async (req, reply) => {
     nextBeforeTs, // le front doit renvoyer ça dans ?beforeTs=... pour "voir plus"
   })
 })
+
 
 // Messages paginés d'une conversation
 // GET /sessions/:id/chats/:jid/messages?limit=20&beforeId=AAAA&beforeFromMe=false
