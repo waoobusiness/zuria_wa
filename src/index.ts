@@ -21,69 +21,71 @@ import path from 'path'
 
 
 // -------------------------
-// CONFIG (variables d'environnement Render)
+// CONFIG
 // -------------------------
 
 // Port HTTP du serveur Fastify
 const PORT = parseInt(process.env.PORT || '3001', 10)
 
-// Dossier persistant monté sur Render (disque).
-// Là-dedans on met la sous-dossier de chaque session: /var/data/wa/<sessionId>/*
+// Dossier persistant monté sur Render (ex /var/data/wa/<sessionId>/*)
 const AUTH_DIR = process.env.AUTH_DIR || './.wa'
 
-// Dossier où on sauvegarde les médias reçus (images, audio, etc.)
-// Par défaut on fait "<AUTH_DIR>/media"
-const MEDIA_DIR =
-  process.env.MEDIA_DIR || path.join(AUTH_DIR, 'media')
+// Dossier pour stocker les médias
+const MEDIA_DIR = process.env.MEDIA_DIR || path.join(AUTH_DIR, 'media')
 
-// URL publique de ton service Baileys (celle de Render)
-// Sert à générer des liens publics vers les médias
-// ex: https://zuria-wa.onrender.com
+// URL publique de ce service (Render). Sert à générer les URLs des médias
 const PUBLIC_BASE_URL =
   process.env.PUBLIC_BASE_URL || 'https://zuria-wa.onrender.com'
 
-// Secret global utilisé pour signer les webhooks sortants
-// (header x-wa-signature)
+// Secret global pour signer les webhooks sortants
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || ''
 
-// Clé d'API optionnelle pour protéger les endpoints sensibles (/messages, etc.)
-// => le front devra envoyer le header:  x-api-key: <API_KEY>
+// API key optionnelle pour protéger les endpoints sensibles
+// (le front doit envoyer header x-api-key: <API_KEY>)
 const API_KEY = process.env.API_KEY || ''
 
 
 // -------------------------
-// TYPES & MÉMOIRE
+// TYPES / MÉMOIRE
 // -------------------------
+
+// conversation récente en RAM (sert à /chats pour la sidebar)
+type RecentChat = {
+  jid: string
+  lastTsMs: number
+  name: string | null
+}
 
 type SessionState = {
   id: string
 
-  // QR code pour affichage dans l'UI :
-  // - qr : data:image/png;base64,...
-  // - qr_text : texte brut du QR (fallback texte du QR)
+  // QR pour affichage (UI)
   qr?: string | null
   qr_text?: string | null
 
-  // état connexion WA
+  // statut WA
   connected: boolean
 
-  // socket Baileys courant
+  // socket Baileys
   sock?: ReturnType<typeof makeWASocket>
 
-  // fonction fournie par Baileys pour persister les credentials multi-fichiers
+  // fonction Baileys pour persister les credentials multi-fichiers
   saveCreds?: () => Promise<void>
 
-  // webhook enregistré par Zuria/Lovable pour CETTE session
+  // webhook (Lovable/Zuria)
   webhookUrl?: string
-  webhookSecret?: string // peut overrider WEBHOOK_SECRET global
+  webhookSecret?: string
 
-  // infos sur le compte WhatsApp connecté
-  meId?: string | null        // ex "4176xxxxxx:29@s.whatsapp.net"
-  meNumber?: string | null    // juste les chiffres
-  phoneNumber?: string | null // alias pratique (= meNumber)
+  // infos du compte WhatsApp connecté
+  meId?: string | null         // ex "4176xxxxxx:29@s.whatsapp.net"
+  meNumber?: string | null     // juste les chiffres
+  phoneNumber?: string | null  // alias pratique (= meNumber)
+
+  // mémoire locale des chats récents
+  recentChats: Map<string, RecentChat>
 }
 
-// toutes les sessions vivantes (en RAM côté serveur)
+// sessions en RAM
 const sessions = new Map<string, SessionState>()
 
 
@@ -94,10 +96,10 @@ const sessions = new Map<string, SessionState>()
 const app = Fastify({ logger: true })
 await app.register(cors, { origin: true })
 
-// s'assurer que le dossier média existe
+// créer le dossier média si besoin
 fs.mkdirSync(MEDIA_DIR, { recursive: true })
 
-// servir les médias statiquement à /media/<fichier>
+// servir les médias en statique
 await app.register(fastifyStatic, {
   root: MEDIA_DIR,
   prefix: '/media/',
@@ -108,21 +110,18 @@ await app.register(fastifyStatic, {
 // HELPERS
 // -------------------------
 
-// chemin du dossier d'auth d'une session
 function getSessionAuthDir(id: string) {
   return path.join(AUTH_DIR, id)
 }
 
-// Ex: "41766085008@s.whatsapp.net"          -> "41766085008"
-//     "41766085008:29@s.whatsapp.net"       -> "41766085008"
+// "41760000000:29@s.whatsapp.net" -> "41760000000"
 function extractPhoneFromJid(jid?: string | null): string | null {
   if (!jid) return null
-  // on prend uniquement les premiers chiffres avant ":" ou "@"
   const m = jid.match(/^(\d{5,20})/)
   return m ? m[1] : null
 }
 
-// MimeType -> extension de fichier simple
+// MimeType -> extension fichier
 function guessExt(mime: string | undefined): string {
   if (!mime) return 'bin'
   if (mime.includes('jpeg')) return 'jpg'
@@ -138,13 +137,10 @@ function guessExt(mime: string | undefined): string {
   return 'bin'
 }
 
-// Télécharge un média (image, audio, etc.) depuis un message Baileys,
-// le stocke dans MEDIA_DIR, puis renvoie { filename, mimeType, url }
+// Télécharge un média reçu via Baileys, le stocke en local et renvoie l'URL publique
 async function saveIncomingMedia(
   msg: any
 ): Promise<null | { filename: string; mimeType: string; url: string }> {
-  // On cherche si ce message contient un média supporté
-  // On traite en priorité image/video/audio/document/sticker
   let mediaType:
     | 'image'
     | 'video'
@@ -172,10 +168,10 @@ async function saveIncomingMedia(
   }
 
   if (!mediaType || !mediaObj) {
-    return null // pas de média
+    return null
   }
 
-  // Récupérer le flux binaire via Baileys
+  // Téléchargement du flux binaire
   const stream = await downloadContentFromMessage(mediaObj, mediaType)
   const chunks: Buffer[] = []
   for await (const chunk of stream) {
@@ -183,12 +179,9 @@ async function saveIncomingMedia(
   }
   const buf = Buffer.concat(chunks)
 
-  // Construire un nom de fichier unique
+  // Nom de fichier unique
   const mimeType =
-    mediaObj.mimetype ||
-    mediaObj.mimetype ||
-    'application/octet-stream'
-
+    mediaObj.mimetype || mediaObj.mimetype || 'application/octet-stream'
   const ext = guessExt(mimeType)
   const filename = `${Date.now()}-${Math.random()
     .toString(36)
@@ -197,12 +190,8 @@ async function saveIncomingMedia(
 
   fs.writeFileSync(absPath, buf)
 
-  // URL publique pour que la plateforme puisse télécharger/afficher
-  // exemple: https://zuria-wa.onrender.com/media/abc123.jpg
-  const publicUrl = `${PUBLIC_BASE_URL.replace(
-    /\/$/,
-    ''
-  )}/media/${filename}`
+  // URL publique de ce média
+  const publicUrl = `${PUBLIC_BASE_URL.replace(/\/$/, '')}/media/${filename}`
 
   return {
     filename,
@@ -211,7 +200,7 @@ async function saveIncomingMedia(
   }
 }
 
-// Transforme un message Baileys brut en format simple pour le front
+// simplifier un message Baileys pour renvoi au front (historique)
 function simplifyBaileysMessage(m: any) {
   const fromMe = m.key?.fromMe === true
 
@@ -230,23 +219,44 @@ function simplifyBaileysMessage(m: any) {
     messageId,
     fromMe,
     text,
-    mediaUrl: null, // pour l'historique: pas de re-download du binaire
+    mediaUrl: null, // pas de re-download du binaire en pagination
     mediaMime: null,
     timestampMs: tsMs,
   }
 }
 
-// Envoi d'un event webhook vers Zuria / Lovable
-// - s : la session
-// - event : ex "message.in", "session.connected"
-// - payload : { data: {...}, ts: Date.now(), ... }
+// On garde une petite liste des chats récents pour la sidebar "Live WhatsApp"
+function touchRecentChat(
+  s: SessionState,
+  jid: string,
+  tsMs: number,
+  nameGuess: string | null
+) {
+  const prev = s.recentChats.get(jid)
+  if (!prev) {
+    s.recentChats.set(jid, {
+      jid,
+      lastTsMs: tsMs,
+      name: nameGuess || null,
+    })
+  } else {
+    if (tsMs > prev.lastTsMs) {
+      prev.lastTsMs = tsMs
+    }
+    if (!prev.name && nameGuess) {
+      prev.name = nameGuess
+    }
+    s.recentChats.set(jid, prev)
+  }
+}
+
+// ENVOI D'UN WEBHOOK vers Supabase/Lovable
 async function sendWebhookEvent(
   s: SessionState,
   event: string,
   payload: Record<string, any>
 ) {
   if (!s.webhookUrl) {
-    // pas de webhook configuré => on log seulement
     app.log.warn({
       msg: 'no webhookUrl for session, drop event',
       sessionId: s.id,
@@ -255,10 +265,8 @@ async function sendWebhookEvent(
     return
   }
 
-  // on signe le webhook
   const signature = s.webhookSecret || WEBHOOK_SECRET || ''
 
-  // body envoyé au webhook
   const body = {
     sessionId: s.id,
     event,
@@ -292,7 +300,7 @@ async function sendWebhookEvent(
   }
 }
 
-// Baileys dit "restart required" avec le code 515
+// Baileys code 515 => restartRequired
 function isRestartRequired(err: any) {
   const code = Number(
     err?.output?.statusCode ??
@@ -301,9 +309,7 @@ function isRestartRequired(err: any) {
       err?.statusCode ??
       0
   )
-  return (
-    code === 515 || code === DisconnectReason.restartRequired
-  )
+  return code === 515 || code === DisconnectReason.restartRequired
 }
 
 
@@ -311,9 +317,8 @@ function isRestartRequired(err: any) {
 // HANDLERS BAILEYS
 // -------------------------
 
-// Gestion des updates de connexion (QR, connecté/déconnecté, etc.)
+// Connexion / QR / déconnexion
 async function onConnectionUpdate(s: SessionState, u: any) {
-  // log utile côté Render
   app.log.info({
     wa_update: {
       conn: u.connection,
@@ -322,42 +327,37 @@ async function onConnectionUpdate(s: SessionState, u: any) {
     },
   })
 
-  // Si Baileys nous donne un nouveau QR => on le stocke pour l'UI
+  // Nouveau QR à afficher
   if (u.qr) {
     s.qr_text = u.qr
     try {
       s.qr = await QRCode.toDataURL(u.qr)
     } catch (e) {
       s.qr = null
-      app.log.warn({
-        msg: 'qr toDataURL failed',
-        err: String(e),
-      })
+      app.log.warn({ msg: 'qr toDataURL failed', err: String(e) })
     }
   }
 
-  // Si on est connecté
+  // Connecté
   if (u.connection === 'open') {
     s.connected = true
     s.qr = null
     s.qr_text = null
 
-    // on essaie d'extraire le numéro du compte WhatsApp lié
-    // Baileys renvoie souvent "me" ou "user" dans l'update
-    // ex u.me.id = "4176XXXXXX:29@s.whatsapp.net"
+    // Récupérer l'ID et le numéro lié
     if (u.me?.id) {
       s.meId = u.me.id || null
-      // on garde juste les chiffres avant ":" ou "@"
       const num = extractPhoneFromJid(s.meId || '')
       s.meNumber = num || null
       s.phoneNumber = s.meNumber || null
     }
 
-    // prévenir la plateforme (Zuria)
+    // webhook "session.connected"
     await sendWebhookEvent(s, 'session.connected', {
       data: {
         meId: s.meId || null,
-        phoneNumber: s.meNumber || null,
+        jid: s.meId || null,
+        phone_number: s.phoneNumber || null,
       },
       ts: Date.now(),
     })
@@ -365,11 +365,11 @@ async function onConnectionUpdate(s: SessionState, u: any) {
     return
   }
 
-  // Si fermeture
+  // Fermeture / déconnexion
   if (u.connection === 'close') {
     const err = (u.lastDisconnect as any)?.error
 
-    // Cas A : Baileys dit "restart required" (code 515)
+    // Cas 515 => restart automatique
     if (isRestartRequired(err)) {
       app.log.warn({
         msg: 'restart required (515) — restarting socket',
@@ -379,7 +379,7 @@ async function onConnectionUpdate(s: SessionState, u: any) {
       return
     }
 
-    // Cas B : vraiment déconnecté / logged out => il faudra rescanner
+    // Cas loggedOut => il faudra rescanner
     const code = Number(
       err?.output?.statusCode ??
         err?.status ??
@@ -389,14 +389,11 @@ async function onConnectionUpdate(s: SessionState, u: any) {
     )
     if (code === DisconnectReason.loggedOut) {
       s.connected = false
-      app.log.warn({
-        msg: 'logged out — rescan required',
-        id: s.id,
-      })
 
       await sendWebhookEvent(s, 'session.disconnected', {
         data: {
           reason: 'loggedOut',
+          phone_number: s.phoneNumber || null,
         },
         ts: Date.now(),
       })
@@ -404,83 +401,88 @@ async function onConnectionUpdate(s: SessionState, u: any) {
       return
     }
 
-    // Autres cas : Baileys va réessayer de se reconnecter
+    // Sinon : juste déconnecté, Baileys va retenter
     s.connected = false
   }
 }
 
-// Gestion des messages entrants
+// Messages entrants/sortants temps réel
 async function onMessagesUpsert(s: SessionState, m: any) {
   const msg = m.messages?.[0]
   if (!msg || !msg.key) return
 
-  const remoteJid = msg.key.remoteJid || '' // ex "4176xxxxxx@s.whatsapp.net"
-  const fromMe = msg.key.fromMe === true // true si c'est NOUS qui parlons
+  const remoteJid = msg.key.remoteJid || '' // "4176xxxxxx@s.whatsapp.net"
+  const fromMe = msg.key.fromMe === true
   const chatNumber = extractPhoneFromJid(remoteJid)
 
-  // Texte du message (le cas le plus fréquent)
+  // timestamp du message
+  const tsMs = Number(msg.messageTimestamp || Date.now()) * 1000
+
+  // mettre à jour la liste des conversations récentes
+  const possibleName: string | null =
+    (msg.pushName && String(msg.pushName)) || null
+  touchRecentChat(s, remoteJid, tsMs, possibleName)
+
+  // texte du message
   const text =
     msg.message?.conversation ||
     msg.message?.extendedTextMessage?.text ||
     msg.message?.imageMessage?.caption ||
     msg.message?.videoMessage?.caption ||
     msg.message?.documentMessage?.caption ||
-    '' // si juste un vocal, etc.
+    ''
 
-  // Si c'est un message média -> on sauvegarde le fichier
+  // media éventuel
   const mediaInfo = await saveIncomingMedia(msg) // peut être null
 
-  // On envoie l'event "message.in" au webhook
-  await sendWebhookEvent(s, 'message.in', {
+  // IMPORTANT :
+  // - Si fromMe === false => message du CLIENT -> "message.in"
+  // - Si fromMe === true  => message envoyé PAR NOUS (téléphone business OU bot) -> "message.out"
+  const eventName = fromMe ? 'message.out' : 'message.in'
+
+  await sendWebhookEvent(s, eventName, {
     data: {
-      from: chatNumber || remoteJid,
+      from: chatNumber || remoteJid,         // numéro du client OU nous selon le sens
       fromJid: remoteJid,
-      fromMe, // super important pour savoir si c'est agent ou client
+      fromMe,
       text,
-      media: mediaInfo, // { url, mimeType, filename } | null
+      media: mediaInfo,                      // { url, mimeType, filename } | null
+      sessionPhone: s.phoneNumber || null,   // numéro de la session WA
+      timestampMs: tsMs,
     },
     ts: Date.now(),
   })
 }
 
-// relier les listeners Baileys à notre session
+// brancher les listeners Baileys
 function attachSocketHandlers(
   s: SessionState,
   sock: ReturnType<typeof makeWASocket>
 ) {
-  // sauve les crédos quand ils changent
   if (s.saveCreds) {
     sock.ev.on('creds.update', s.saveCreds)
   }
-
-  // updates de connexion (QR, ouvert, fermé, etc.)
-  sock.ev.on('connection.update', async (u) =>
-    onConnectionUpdate(s, u)
-  )
-
-  // messages entrants
-  sock.ev.on('messages.upsert', async (m) =>
-    onMessagesUpsert(s, m)
-  )
+  sock.ev.on('connection.update', async (u) => onConnectionUpdate(s, u))
+  sock.ev.on('messages.upsert', async (m) => onMessagesUpsert(s, m))
 }
 
 
 // -------------------------
-// CYCLE DE VIE D'UNE SESSION
+// CYCLE DE VIE DES SESSIONS
 // -------------------------
 
-// crée / recrée vraiment le socket pour une session donnée
+// Crée un socket Baileys pour une session donnée
 async function buildSessionSocket(id: string): Promise<SessionState> {
   // s'assure que le dossier d'auth existe
   fs.mkdirSync(getSessionAuthDir(id), { recursive: true })
 
-  // récupère l'état multi-fichiers (tokens WhatsApp) depuis le disque
+  // charge l'état multi-fichiers
   const { state, saveCreds } = await useMultiFileAuthState(
     getSessionAuthDir(id)
   )
   const { version } = await fetchLatestBaileysVersion()
 
-  // objet session en RAM
+  // prépare notre session en RAM
   const s: SessionState = {
     id,
     qr: null,
@@ -490,9 +492,10 @@ async function buildSessionSocket(id: string): Promise<SessionState> {
     phoneNumber: null,
     meId: null,
     meNumber: null,
+    recentChats: new Map<string, RecentChat>(),
   }
 
-  // créer le socket
+  // crée le socket
   const sock = makeWASocket({
     version,
     auth: state,
@@ -501,39 +504,37 @@ async function buildSessionSocket(id: string): Promise<SessionState> {
     connectTimeoutMs: 60_000,
     defaultQueryTimeoutMs: 60_000,
   })
-
   s.sock = sock
 
-  // brancher les listeners sur ce socket
+  // branche les handlers
   attachSocketHandlers(s, sock)
 
-  // stocker/mettre à jour dans la map globale
+  // stocke en RAM
   sessions.set(id, s)
 
   return s
 }
 
-// assure qu'une session est en mémoire & a un socket vivant
+// Charge la session en RAM ou la reconstruit depuis disque
 async function ensureSessionLoaded(id: string): Promise<SessionState> {
   const existing = sessions.get(id)
   if (existing?.sock) {
     return existing
   }
-  // pas en RAM -> on recrée depuis le disque (sans effacer les creds)
+  // pas en RAM -> reconstruire
   const s = await buildSessionSocket(id)
   return s
 }
 
-// redémarrer une session
-// resetAuth=true => on efface les anciens credentials sur disque,
-//                   donc on force une NOUVELLE connexion avec QR.
+// Redémarrer une session. resetAuth=true => on supprime ses creds,
+// donc l'utilisateur devra rescanner un QR.
 async function restartSession(
   id: string,
   opts: { resetAuth: boolean }
 ): Promise<SessionState> {
   const old = sessions.get(id)
 
-  // nettoyer l'ancien socket si présent
+  // couper l'ancien socket
   if (old?.sock) {
     try {
       ;(old.sock as any)?.ev?.removeAllListeners?.()
@@ -543,7 +544,7 @@ async function restartSession(
     } catch {}
   }
 
-  // si on veut forcer une reconnexion propre (nouveau scan)
+  // si on veut un tout nouveau login => effacer les creds
   if (opts.resetAuth) {
     try {
       fs.rmSync(getSessionAuthDir(id), {
@@ -553,13 +554,12 @@ async function restartSession(
     } catch {}
   }
 
-  // recréer proprement à partir du disque (éventuellement vide -> QR)
+  // reconstruire
   const fresh = await buildSessionSocket(id)
   return fresh
 }
 
-// crée une NOUVELLE session (nouvel ID)
-// => utilisé quand tu cliques "Créer une session" sur /
+// Crée une toute nouvelle session (nouvel ID)
 async function startSession(newId: string) {
   const s = await buildSessionSocket(newId)
   return s
@@ -570,7 +570,7 @@ async function startSession(newId: string) {
 // ROUTES HTTP
 // -------------------------
 
-// Petite UI manuelle pour créer une session et voir le QR
+// Page de test pour créer une session à la main et voir le QR
 app.get('/', async (_req, reply) => {
   const html = `
   <html>
@@ -622,7 +622,7 @@ app.get('/', async (_req, reply) => {
   reply.type('text/html').send(html)
 })
 
-// Mini console d’envoi de message pour test humain
+// Mini console d'envoi manuel
 app.get('/send', async (_req, reply) => {
   const html = `
   <html>
@@ -690,22 +690,21 @@ app.get('/send', async (_req, reply) => {
   reply.type('text/html').send(html)
 })
 
-// Créer une session (=> retourne l'ID)
-// -> on génère un nouvel UUID et on démarre un socket pour cette session
+// Créer une nouvelle session => renvoie son ID
 app.post('/sessions', async (_req, reply) => {
   const id = uuid()
   app.log.info({ msg: 'create session', id })
   const s = await startSession(id)
-  // on laisse ~500ms à Baileys pour éventuellement déjà générer un QR
+
+  // petite pause pour que Baileys ait le temps de générer un QR
   await new Promise((res) => setTimeout(res, 500))
+
   return reply.send({ session_id: s.id })
 })
 
 // Récupérer l'état d'une session
 app.get('/sessions/:id', async (req, reply) => {
   const id = (req.params as any).id
-
-  // assure qu'elle est (re)chargée en mémoire si besoin
   const s = await ensureSessionLoaded(id).catch(() => null)
   if (!s) {
     return reply.code(404).send({ error: 'unknown session' })
@@ -723,9 +722,8 @@ app.get('/sessions/:id', async (req, reply) => {
   })
 })
 
-// Redémarrer / reconnecter une session (bouton "Reconnecter")
-// IMPORTANT: ici on FORCE resetAuth: true
-// -> on supprime les anciens credentials => Baileys va demander un NOUVEAU QR
+// Redémarrer / Reconnecter : on efface les creds pour FORCER un nouveau QR
+// (c'est ce que ton bouton "Reconnecter" doit faire)
 app.post('/sessions/:id/restart', async (req, reply) => {
   const id = (req.params as any).id
   try {
@@ -734,7 +732,6 @@ app.post('/sessions/:id/restart', async (req, reply) => {
       ok: true,
       session_id: s.id,
       connected: s.connected,
-      // on peut indiquer au front qu'il doit afficher le modal QR:
       needScan: true,
     })
   } catch (e: any) {
@@ -749,13 +746,10 @@ app.post('/sessions/:id/restart', async (req, reply) => {
   }
 })
 
-// Enregistrer / mettre à jour le webhook pour une session
-// Body attendu:
-// { "url": "https://.../whatsapp-webhook-gateway?session_id=xxx",
-//   "secret": "xxxxx-optional" }
+// Enregistrer / Mettre à jour le webhook pour une session
+// Body attendu: { "url": "...", "secret": "..." (optionnel) }
 app.post('/sessions/:id/webhook', async (req, reply) => {
   const id = (req.params as any).id
-
   const s = await ensureSessionLoaded(id).catch(() => null)
   if (!s) return reply.code(404).send({ error: 'unknown session' })
 
@@ -776,11 +770,12 @@ app.post('/sessions/:id/webhook', async (req, reply) => {
   })
 })
 
-// Envoyer un message sortant
-// Body attendu:
-// { "sessionId": "...", "to": "4176xxxxxxx", "text": "hello" }
-app.post('/messages', async (req, reply) => {
-  // auth API_KEY si défini
+// Liste paginée des conversations récentes (sidebar Live WhatsApp)
+// GET /sessions/:id/chats?limit=20&beforeTs=...
+app.get('/sessions/:id/chats', async (req, reply) => {
+  const id = (req.params as any).id
+
+  // protéger avec API_KEY si fourni
   if (API_KEY) {
     const hdr = req.headers['x-api-key']
     if (!hdr || hdr !== API_KEY) {
@@ -788,37 +783,52 @@ app.post('/messages', async (req, reply) => {
     }
   }
 
-  const { sessionId, to, text } = (req.body as any) || {}
-
-  // s'assurer que la session est chargée
-  const s = await ensureSessionLoaded(sessionId).catch(() => null)
-  if (!s?.sock) {
-    return reply
-      .code(400)
-      .send({ error: 'session not ready' })
+  const s = await ensureSessionLoaded(id).catch(() => null)
+  if (!s) {
+    return reply.code(404).send({ error: 'unknown session' })
   }
 
-  const jid = `${String(to).replace(/[^\d]/g, '')}@s.whatsapp.net`
-  await s.sock.sendMessage(jid, { text: String(text || '') })
+  const q = (req.query as any) || {}
+  const limit = Math.min(Number(q.limit || 20), 50)
+  const beforeTs = Number(q.beforeTs || 0)
 
-  // envoyer aussi un webhook "message.out"
-  await sendWebhookEvent(s, 'message.out', {
-    data: {
-      to: jid,
-      text: String(text || ''),
-    },
-    ts: Date.now(),
+  // on lit notre Map locale
+  const rawChats: RecentChat[] = Array.from(s.recentChats.values())
+
+  // tri du plus récent au plus ancien
+  const sorted = rawChats.sort((a, b) => b.lastTsMs - a.lastTsMs)
+
+  // pagination "avant telle date"
+  const filtered =
+    beforeTs > 0
+      ? sorted.filter((c) => c.lastTsMs < beforeTs)
+      : sorted
+
+  const page = filtered.slice(0, limit)
+
+  const chats = page.map((chat) => ({
+    chatJid: chat.jid,
+    chatNumber: extractPhoneFromJid(chat.jid),
+    chatName: chat.name || null,
+    lastTsMs: chat.lastTsMs,
+  }))
+
+  const nextBeforeTs =
+    page.length > 0 ? page[page.length - 1].lastTsMs : null
+
+  return reply.send({
+    ok: true,
+    chats,
+    nextBeforeTs,
   })
-
-  return reply.send({ ok: true })
 })
 
-// Messages paginés d'une conversation
-// GET /sessions/:id/chats/:jid/messages?limit=20&beforeId=...&beforeFromMe=true|false
+// Historique paginé des messages d'une conversation
+// GET /sessions/:id/chats/:jid/messages?limit=20&beforeId=...&beforeFromMe=...
 app.get('/sessions/:id/chats/:jid/messages', async (req, reply) => {
   const { id, jid } = (req.params as any)
 
-  // auth API_KEY si défini
+  // protéger avec API_KEY si fourni
   if (API_KEY) {
     const hdr = req.headers['x-api-key']
     if (!hdr || hdr !== API_KEY) {
@@ -829,82 +839,144 @@ app.get('/sessions/:id/chats/:jid/messages', async (req, reply) => {
   const q = (req.query as any) || {}
   const limit = Math.min(Number(q.limit || 20), 50)
 
-  // curseur de pagination
+  // curseur pagination
   const beforeId = q.beforeId ? String(q.beforeId) : undefined
   let beforeFromMe: boolean | undefined = undefined
-  if (
-    q.beforeFromMe === 'true' ||
-    q.beforeFromMe === true
-  ) {
+  if (q.beforeFromMe === 'true' || q.beforeFromMe === true) {
     beforeFromMe = true
-  } else if (
-    q.beforeFromMe === 'false' ||
-    q.beforeFromMe === false
-  ) {
+  } else if (q.beforeFromMe === 'false' || q.beforeFromMe === false) {
     beforeFromMe = false
   }
 
-  // charger / créer la session en mémoire
   const s = await ensureSessionLoaded(id).catch(() => null)
   if (!s?.sock) {
-    return reply
-      .code(400)
-      .send({ error: 'session not ready' })
+    return reply.code(400).send({ error: 'session not ready' })
   }
 
-  // Baileys attend un "cursor" facultatif { id, fromMe, remoteJid }
+  // Baileys attend un cursor éventuel { id, fromMe, remoteJid }
   const cursor =
     beforeId && typeof beforeFromMe === 'boolean'
-      ? {
-          id: beforeId,
-          fromMe: beforeFromMe,
-          remoteJid: jid,
-        }
+      ? { id: beforeId, fromMe: beforeFromMe, remoteJid: jid }
       : undefined
 
   let rawMsgs: any[] = []
   try {
-    // charge les messages du plus récent vers le plus ancien
-    rawMsgs = await (s.sock as any).loadMessages(
-      jid,
-      limit,
-      cursor
-    )
+    rawMsgs = await (s.sock as any).loadMessages(jid, limit, cursor)
   } catch (e: any) {
-    return reply
-      .code(500)
-      .send({
-        error: 'loadMessages failed',
-        detail: String(e),
-      })
+    return reply.code(500).send({
+      error: 'loadMessages failed',
+      detail: String(e),
+    })
   }
 
   const messages = rawMsgs.map(simplifyBaileysMessage)
 
-  // prépare le curseur pour "page suivante" = le dernier (donc le plus ancien) de cette page
   const last = messages[messages.length - 1]
   const nextCursor = last
-    ? {
-        beforeId: last.messageId,
-        beforeFromMe: last.fromMe,
-      }
+    ? { beforeId: last.messageId, beforeFromMe: last.fromMe }
     : null
 
   return reply.send({
     ok: true,
     messages,
-    nextCursor, // le front renverra ça pour charger encore plus vieux
+    nextCursor,
   })
 })
 
-// Healthcheck basique
+// ENVOI d'un message "classique" (notre ancienne route interne)
+// Body: { sessionId, to (numero sans @), text }
+app.post('/messages', async (req, reply) => {
+  if (API_KEY) {
+    const hdr = req.headers['x-api-key']
+    if (!hdr || hdr !== API_KEY) {
+      return reply.code(401).send({ error: 'unauthorized' })
+    }
+  }
+
+  const { sessionId, to, text } = (req.body as any) || {}
+  const s = await ensureSessionLoaded(sessionId).catch(() => null)
+  if (!s?.sock) {
+    return reply.code(400).send({ error: 'session not ready' })
+  }
+
+  const cleanTo = String(to || '').replace(/[^\d]/g, '')
+  const jid = `${cleanTo}@s.whatsapp.net`
+  const messageText = String(text || '')
+
+  await s.sock.sendMessage(jid, { text: messageText })
+
+  // recentChats bump
+  const nowMs = Date.now()
+  touchRecentChat(s, jid, nowMs, null)
+
+  // webhook "message.out"
+  await sendWebhookEvent(s, 'message.out', {
+    data: {
+      from: jid,
+      fromJid: jid,
+      fromMe: true,
+      text: messageText,
+      media: null,
+      sessionPhone: s.phoneNumber || null,
+      timestampMs: nowMs,
+    },
+    ts: nowMs,
+  })
+
+  return reply.send({ ok: true })
+})
+
+// ENVOI d'un message façon Lovable (`wa-send-message`)
+// POST /sessions/:id/send
+// Body attendu: { jid: "4176...@s.whatsapp.net", message: "Hello" }
+app.post('/sessions/:id/send', async (req, reply) => {
+  const id = (req.params as any).id
+
+  if (API_KEY) {
+    const hdr = req.headers['x-api-key']
+    if (!hdr || hdr !== API_KEY) {
+      return reply.code(401).send({ error: 'unauthorized' })
+    }
+  }
+
+  const { jid, message } = (req.body as any) || {}
+  const s = await ensureSessionLoaded(id).catch(() => null)
+  if (!s?.sock) {
+    return reply.code(400).send({ error: 'session not ready' })
+  }
+
+  const finalJid = String(jid || '')
+  const finalText = String(message || '')
+
+  await s.sock.sendMessage(finalJid, { text: finalText })
+
+  // mettre à jour recentChats
+  const nowMs = Date.now()
+  touchRecentChat(s, finalJid, nowMs, null)
+
+  // webhook "message.out"
+  await sendWebhookEvent(s, 'message.out', {
+    data: {
+      from: finalJid,
+      fromJid: finalJid,
+      fromMe: true,
+      text: finalText,
+      media: null,
+      sessionPhone: s.phoneNumber || null,
+      timestampMs: nowMs,
+    },
+    ts: nowMs,
+  })
+
+  return reply.send({ ok: true })
+})
+
+// healthcheck
 app.get('/health', async (_req, reply) => {
   reply.send({ ok: true })
 })
 
-// -------------------------
-// START HTTP SERVER
-// -------------------------
+// Lancer HTTP
 app.listen({ port: PORT, host: '0.0.0.0' }).then(() => {
   app.log.info(`HTTP server listening on ${PORT}`)
 })
