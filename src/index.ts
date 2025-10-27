@@ -19,6 +19,7 @@ import makeWASocket, {
 import fs from 'fs'
 import path from 'path'
 
+
 // -------------------------
 // CONFIG (variables d'environnement Render)
 // -------------------------
@@ -106,6 +107,11 @@ await app.register(fastifyStatic, {
 // -------------------------
 // HELPERS
 // -------------------------
+
+// chemin du dossier d'auth d'une session
+function getSessionAuthDir(id: string) {
+  return path.join(AUTH_DIR, id)
+}
 
 // Ex: "41766085008@s.whatsapp.net"          -> "41766085008"
 //     "41766085008:29@s.whatsapp.net"       -> "41766085008"
@@ -224,7 +230,7 @@ function simplifyBaileysMessage(m: any) {
     messageId,
     fromMe,
     text,
-    mediaUrl: null, // dans l'historique on ne retélécharge pas le binaire
+    mediaUrl: null, // pour l'historique: pas de re-download du binaire
     mediaMime: null,
     timestampMs: tsMs,
   }
@@ -369,7 +375,7 @@ async function onConnectionUpdate(s: SessionState, u: any) {
         msg: 'restart required (515) — restarting socket',
         id: s.id,
       })
-      await restartSession(s.id)
+      await restartSession(s.id, { resetAuth: false })
       return
     }
 
@@ -463,14 +469,14 @@ function attachSocketHandlers(
 // CYCLE DE VIE D'UNE SESSION
 // -------------------------
 
-// helper: (re)crée un socket Baileys pour une session donnée
+// crée / recrée vraiment le socket pour une session donnée
 async function buildSessionSocket(id: string): Promise<SessionState> {
   // s'assure que le dossier d'auth existe
-  fs.mkdirSync(path.join(AUTH_DIR, id), { recursive: true })
+  fs.mkdirSync(getSessionAuthDir(id), { recursive: true })
 
   // récupère l'état multi-fichiers (tokens WhatsApp) depuis le disque
   const { state, saveCreds } = await useMultiFileAuthState(
-    path.join(AUTH_DIR, id)
+    getSessionAuthDir(id)
   )
   const { version } = await fetchLatestBaileysVersion()
 
@@ -513,14 +519,18 @@ async function ensureSessionLoaded(id: string): Promise<SessionState> {
   if (existing?.sock) {
     return existing
   }
-  // pas en RAM -> on recrée depuis le disque
+  // pas en RAM -> on recrée depuis le disque (sans effacer les creds)
   const s = await buildSessionSocket(id)
   return s
 }
 
-// (ré)initialise le socket pour une session existante
-// utilisé pour les cas "restart required (515)" ou bouton "Reconnecter"
-async function restartSession(id: string): Promise<SessionState> {
+// redémarrer une session
+// resetAuth=true => on efface les anciens credentials sur disque,
+//                   donc on force une NOUVELLE connexion avec QR.
+async function restartSession(
+  id: string,
+  opts: { resetAuth: boolean }
+): Promise<SessionState> {
   const old = sessions.get(id)
 
   // nettoyer l'ancien socket si présent
@@ -533,7 +543,17 @@ async function restartSession(id: string): Promise<SessionState> {
     } catch {}
   }
 
-  // recréer proprement à partir du disque
+  // si on veut forcer une reconnexion propre (nouveau scan)
+  if (opts.resetAuth) {
+    try {
+      fs.rmSync(getSessionAuthDir(id), {
+        recursive: true,
+        force: true,
+      })
+    } catch {}
+  }
+
+  // recréer proprement à partir du disque (éventuellement vide -> QR)
   const fresh = await buildSessionSocket(id)
   return fresh
 }
@@ -703,15 +723,19 @@ app.get('/sessions/:id', async (req, reply) => {
   })
 })
 
-// Redémarrer / reconnecter une session (bouton "Reconnecter" côté Zuria/Lovable)
+// Redémarrer / reconnecter une session (bouton "Reconnecter")
+// IMPORTANT: ici on FORCE resetAuth: true
+// -> on supprime les anciens credentials => Baileys va demander un NOUVEAU QR
 app.post('/sessions/:id/restart', async (req, reply) => {
   const id = (req.params as any).id
   try {
-    const s = await restartSession(id)
+    const s = await restartSession(id, { resetAuth: true })
     return reply.send({
       ok: true,
       session_id: s.id,
       connected: s.connected,
+      // on peut indiquer au front qu'il doit afficher le modal QR:
+      needScan: true,
     })
   } catch (e: any) {
     app.log.error({
