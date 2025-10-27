@@ -14,8 +14,11 @@ import makeWASocket, {
   DisconnectReason,
   fetchLatestBaileysVersion,
   downloadContentFromMessage,
-  makeInMemoryStore,
 } from '@whiskeysockets/baileys'
+
+// IMPORTANT: certaines versions de Baileys ne ré-exportent pas makeInMemoryStore
+// donc on l'importe directement depuis lib/Store pour éviter l'erreur TS2614
+import { makeInMemoryStore } from '@whiskeysockets/baileys/lib/Store'
 
 import fs from 'fs'
 import path from 'path'
@@ -44,7 +47,6 @@ const PUBLIC_BASE_URL =
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || ''
 
 // Clé d'API optionnelle pour protéger certains endpoints (messages, chats...)
-// Le front/edge functions doivent envoyer:  x-api-key: <API_KEY>
 const API_KEY = process.env.API_KEY || ''
 
 
@@ -108,8 +110,8 @@ await app.register(fastifyStatic, {
 // HELPERS
 // -------------------------
 
-// "41766085008@s.whatsapp.net"           -> "41766085008"
-// "41766085008:29@s.whatsapp.net"        -> "41766085008"
+// "41766085008@s.whatsapp.net"  -> "41766085008"
+// "41766085008:29@s.whatsapp.net" -> "41766085008"
 function extractPhoneFromJid(jid?: string | null): string | null {
   if (!jid) return null
   const m = jid.match(/^(\d{5,20})/)
@@ -180,13 +182,18 @@ async function saveIncomingMedia(
   // Nom de fichier unique
   const mimeType = mediaObj.mimetype || 'application/octet-stream'
   const ext = guessExt(mimeType)
-  const filename = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`
+  const filename = `${Date.now()}-${Math.random()
+    .toString(36)
+    .slice(2, 8)}.${ext}`
   const absPath = path.join(MEDIA_DIR, filename)
 
   fs.writeFileSync(absPath, buf)
 
   // URL publique servie par /media
-  const publicUrl = `${PUBLIC_BASE_URL.replace(/\/$/, '')}/media/${filename}`
+  const publicUrl = `${PUBLIC_BASE_URL.replace(
+    /\/$/,
+    ''
+  )}/media/${filename}`
 
   return {
     filename,
@@ -214,7 +221,7 @@ function simplifyBaileysMessage(m: any) {
     messageId,
     fromMe,
     text,
-    mediaUrl: null, // pas de re-téléchargement du binaire dans l'historique
+    mediaUrl: null, // pour la pagination historique on n'essaie pas de re-télécharger le binaire
     mediaMime: null,
     timestampMs: tsMs,
   }
@@ -404,8 +411,8 @@ async function onMessagesUpsert(s: SessionState, m: any) {
   // média si présent
   const mediaInfo = await saveIncomingMedia(msg) // peut être null
 
-  // push webhook "message.in"
-  // côté Lovable on lit `fromMe` pour savoir si c'est l'entreprise ou le client
+  // push webhook "message.in" (ou "message.out", mais on reste cohérent:
+  // côté Lovable on regarde fromMe pour savoir le sens)
   await sendWebhookEvent(s, 'message.in', {
     data: {
       from: chatNumber || remoteJid,
@@ -429,10 +436,14 @@ function attachSocketHandlers(
   }
 
   // updates de connexion (QR, open, close...)
-  sock.ev.on('connection.update', async (u) => onConnectionUpdate(s, u))
+  sock.ev.on('connection.update', async (u) =>
+    onConnectionUpdate(s, u)
+  )
 
   // messages entrants
-  sock.ev.on('messages.upsert', async (m) => onMessagesUpsert(s, m))
+  sock.ev.on('messages.upsert', async (m) =>
+    onMessagesUpsert(s, m)
+  )
 }
 
 
@@ -721,7 +732,9 @@ app.post('/sessions/:id/webhook', async (req, reply) => {
 
   const { url, secret } = (req.body as any) || {}
   if (!url) {
-    return reply.code(400).send({ error: 'missing url' })
+    return reply
+      .code(400)
+      .send({ error: 'missing url' })
   }
 
   s.webhookUrl = String(url)
@@ -745,14 +758,18 @@ app.post('/messages', async (req, reply) => {
   if (API_KEY) {
     const hdr = req.headers['x-api-key']
     if (!hdr || hdr !== API_KEY) {
-      return reply.code(401).send({ error: 'unauthorized' })
+      return reply
+        .code(401)
+        .send({ error: 'unauthorized' })
     }
   }
 
   const { sessionId, to, text } = (req.body as any) || {}
   const s = sessions.get(sessionId)
   if (!s?.sock) {
-    return reply.code(400).send({ error: 'session not ready' })
+    return reply
+      .code(400)
+      .send({ error: 'session not ready' })
   }
 
   const jid = `${String(to).replace(/[^\d]/g, '')}@s.whatsapp.net`
@@ -782,14 +799,18 @@ app.get('/sessions/:id/chats', async (req, reply) => {
   const id = (req.params as any).id
   const s = sessions.get(id)
   if (!s?.sock) {
-    return reply.code(400).send({ error: 'session not ready' })
+    return reply
+      .code(400)
+      .send({ error: 'session not ready' })
   }
 
   // sécurité API_KEY identique à /messages
   if (API_KEY) {
     const hdr = req.headers['x-api-key']
     if (!hdr || hdr !== API_KEY) {
-      return reply.code(401).send({ error: 'unauthorized' })
+      return reply
+        .code(401)
+        .send({ error: 'unauthorized' })
     }
   }
 
@@ -823,7 +844,8 @@ app.get('/sessions/:id/chats', async (req, reply) => {
     beforeTs > 0
       ? sorted.filter(
           (c: any) =>
-            Number(c.conversationTimestamp || 0) * 1000 < beforeTs
+            Number(c.conversationTimestamp || 0) * 1000 <
+            beforeTs
         )
       : sorted
 
@@ -834,13 +856,16 @@ app.get('/sessions/:id/chats', async (req, reply) => {
     chatJid: chat.id,
     chatNumber: extractPhoneFromJid(chat.id),
     chatName: chat.name || chat.subject || null,
-    lastTsMs: Number(chat.conversationTimestamp || 0) * 1000,
+    lastTsMs:
+      Number(chat.conversationTimestamp || 0) * 1000,
   }))
 
   // curseur pour la page suivante
   const nextBeforeTs =
     page.length > 0
-      ? Number(page[page.length - 1].conversationTimestamp || 0) * 1000
+      ? Number(
+          page[page.length - 1].conversationTimestamp || 0
+        ) * 1000
       : null
 
   return reply.send({
@@ -857,89 +882,102 @@ app.get('/sessions/:id/chats', async (req, reply) => {
 // - limit: max 50 (défaut 20)
 // - beforeId & beforeFromMe : servent de curseur pour demander plus ancien
 //   (le front les récupère dans nextCursor)
-app.get('/sessions/:id/chats/:jid/messages', async (req, reply) => {
-  const { id, jid } = (req.params as any)
-  const s = sessions.get(id)
-  if (!s?.sock) {
-    return reply.code(400).send({ error: 'session not ready' })
-  }
-
-  if (API_KEY) {
-    const hdr = req.headers['x-api-key']
-    if (!hdr || hdr !== API_KEY) {
-      return reply.code(401).send({ error: 'unauthorized' })
+app.get(
+  '/sessions/:id/chats/:jid/messages',
+  async (req, reply) => {
+    const { id, jid } = (req.params as any)
+    const s = sessions.get(id)
+    if (!s?.sock) {
+      return reply
+        .code(400)
+        .send({ error: 'session not ready' })
     }
-  }
 
-  const q = (req.query as any) || {}
-  const limit = Math.min(Number(q.limit || 20), 50)
+    if (API_KEY) {
+      const hdr = req.headers['x-api-key']
+      if (!hdr || hdr !== API_KEY) {
+        return reply
+          .code(401)
+          .send({ error: 'unauthorized' })
+      }
+    }
 
-  // curseur de pagination
-  const beforeId = q.beforeId ? String(q.beforeId) : undefined
+    const q = (req.query as any) || {}
+    const limit = Math.min(Number(q.limit || 20), 50)
 
-  let beforeFromMe: boolean | undefined = undefined
-  if (q.beforeFromMe === 'true' || q.beforeFromMe === true) {
-    beforeFromMe = true
-  } else if (q.beforeFromMe === 'false' || q.beforeFromMe === false) {
-    beforeFromMe = false
-  }
-
-  // Baileys attend un "cursor" facultatif { id, fromMe, remoteJid }
-  const cursor =
-    beforeId && typeof beforeFromMe === 'boolean'
-      ? {
-          id: beforeId,
-          fromMe: beforeFromMe,
-          remoteJid: jid,
-        }
+    // curseur de pagination
+    const beforeId = q.beforeId
+      ? String(q.beforeId)
       : undefined
 
-  let rawMsgs: any[] = []
-  try {
-    // charge les messages du plus récent vers le plus ancien
-    rawMsgs = await (s.sock as any).loadMessages(jid, limit, cursor)
-  } catch (e: any) {
-    return reply.code(500).send({
-      error: 'loadMessages failed',
-      detail: String(e),
+    let beforeFromMe: boolean | undefined = undefined
+    if (
+      q.beforeFromMe === 'true' ||
+      q.beforeFromMe === true
+    ) {
+      beforeFromMe = true
+    } else if (
+      q.beforeFromMe === 'false' ||
+      q.beforeFromMe === false
+    ) {
+      beforeFromMe = false
+    }
+
+    // Baileys attend un "cursor" facultatif { id, fromMe, remoteJid }
+    const cursor =
+      beforeId &&
+      typeof beforeFromMe === 'boolean'
+        ? {
+            id: beforeId,
+            fromMe: beforeFromMe,
+            remoteJid: jid,
+          }
+        : undefined
+
+    let rawMsgs: any[] = []
+    try {
+      // charge les messages du plus récent vers le plus ancien
+      rawMsgs = await (s.sock as any).loadMessages(
+        jid,
+        limit,
+        cursor
+      )
+    } catch (e: any) {
+      return reply.code(500).send({
+        error: 'loadMessages failed',
+        detail: String(e),
+      })
+    }
+
+    const messages = rawMsgs.map(simplifyBaileysMessage)
+
+    // curseur pour page suivante = le plus ancien de cette page
+    const last = messages[messages.length - 1]
+    const nextCursor = last
+      ? {
+          beforeId: last.messageId,
+          beforeFromMe: last.fromMe,
+        }
+      : null
+
+    return reply.send({
+      ok: true,
+      messages,
+      nextCursor, // le front renverra ça pour "Charger plus de messages"
     })
   }
-
-  const messages = rawMsgs.map(simplifyBaileysMessage)
-
-  // curseur pour page suivante = le plus ancien de cette page
-  const last = messages[messages.length - 1]
-  const nextCursor = last
-    ? {
-        beforeId: last.messageId,
-        beforeFromMe: last.fromMe,
-      }
-    : null
-
-  return reply.send({
-    ok: true,
-    messages,
-    nextCursor, // le front renverra ça pour "Charger plus de messages"
-  })
-})
-
+)
 
 // Déconnexion COMPLÈTE d'une session WhatsApp
-// => logout WhatsApp + suppression des credentials + suppression de la session mémoire
+// => logout WhatsApp + suppression credentials + suppression de la session mémoire
 app.post('/sessions/:id/logout', async (req, reply) => {
-  // 0. Sécurité via API_KEY, même logique que /messages, /chats...
-  if (API_KEY) {
-    const hdr = req.headers['x-api-key']
-    if (!hdr || hdr !== API_KEY) {
-      return reply.code(401).send({ error: 'unauthorized' })
-    }
-  }
-
   const id = (req.params as any).id
   const s = sessions.get(id)
 
   if (!s) {
-    return reply.code(404).send({ error: 'unknown session' })
+    return reply
+      .code(404)
+      .send({ error: 'unknown session' })
   }
 
   // 1. tenter le logout WhatsApp pour retirer l'appareil des "appareils connectés"
@@ -1002,6 +1040,8 @@ app.get('/health', async (_req, reply) => {
 // -------------------------
 // START HTTP SERVER
 // -------------------------
-app.listen({ port: PORT, host: '0.0.0.0' }).then(() => {
-  app.log.info(`HTTP server listening on ${PORT}`)
-})
+app
+  .listen({ port: PORT, host: '0.0.0.0' })
+  .then(() => {
+    app.log.info(`HTTP server listening on ${PORT}`)
+  })
