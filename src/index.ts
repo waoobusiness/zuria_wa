@@ -13,63 +13,104 @@ import makeWASocket, {
   useMultiFileAuthState,
   DisconnectReason,
   fetchLatestBaileysVersion,
-  downloadContentFromMessage,
+  downloadContentFromMessage
 } from '@whiskeysockets/baileys'
-
-// NOTE: sur certaines versions, les typings n’exposent pas makeInMemoryStore en named export.
-// On passe par un import namespace pour l’attraper de façon sûre.
-import * as Baileys from '@whiskeysockets/baileys'
-const makeInMemoryStore: any = (Baileys as any).makeInMemoryStore
 
 import fs from 'fs'
 import path from 'path'
 
-
 // -------------------------
-// CONFIG (variables d'environnement Render)
+// CONFIG
 // -------------------------
 const PORT = parseInt(process.env.PORT || '3001', 10)
 const AUTH_DIR = process.env.AUTH_DIR || './.wa'
 const MEDIA_DIR = process.env.MEDIA_DIR || path.join(AUTH_DIR, 'media')
-const PUBLIC_BASE_URL =
-  process.env.PUBLIC_BASE_URL || 'https://zuria-wa.onrender.com'
+const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || 'https://zuria-wa.onrender.com').replace(/\/$/, '')
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || ''
 const API_KEY = process.env.API_KEY || ''
 
+// -------------------------
+// TYPES & MEMORY
+// -------------------------
 
-// -------------------------
-// TYPES & MÉMOIRE
-// -------------------------
+type ChatLite = {
+  id: string
+  name?: string | null
+  subject?: string | null
+  conversationTimestamp?: number | string | null // seconds (baileys)
+}
+
 type SessionState = {
   id: string
+
+  // QR code for the UI
   qr?: string | null
   qr_text?: string | null
+
+  // connection state
   connected: boolean
+
+  // Baileys socket
   sock?: ReturnType<typeof makeWASocket>
-  store?: any                 // <= pour éviter un blocage TS avec les typings Baileys
+
+  // credentials persister
   saveCreds?: () => Promise<void>
+
+  // per-session webhook
   webhookUrl?: string
   webhookSecret?: string
+
+  // account info
   meId?: string | null
   meNumber?: string | null
   phoneNumber?: string | null
+
+  // in-memory minimal stores (avoid makeInMemoryStore)
+  chats: Map<string, ChatLite>
+  contacts: Map<string, { notify?: string; name?: string }>
 }
 
 const sessions = new Map<string, SessionState>()
-
 
 // -------------------------
 // FASTIFY BOOT
 // -------------------------
 const app = Fastify({ logger: true })
-await app.register(cors, { origin: true })
-fs.mkdirSync(MEDIA_DIR, { recursive: true })
 
-await app.register(fastifyStatic, {
-  root: MEDIA_DIR,
-  prefix: '/media/',
+// permissive CORS
+await app.register(cors, { origin: true })
+
+// permissive JSON parser (accepts empty body with content-type application/json)
+app.addContentTypeParser('application/json', { parseAs: 'string' }, (req, body, done) => {
+  try {
+    if (!body || (typeof body === 'string' && body.trim() === '')) {
+      done(null, {})
+      return
+    }
+    const json = typeof body === 'string' ? JSON.parse(body) : body
+    done(null, json)
+  } catch (e) {
+    done(e as any, undefined)
+  }
 })
 
+// prefix fallback: allow calling /api/* the same as /*
+app.addHook('onRequest', (req, _reply, done) => {
+  if (req.url.startsWith('/api/')) {
+    // strip /api prefix
+    req.url = req.url.slice(4)
+  }
+  done()
+})
+
+// ensure media dir
+fs.mkdirSync(MEDIA_DIR, { recursive: true })
+
+// static media
+await app.register(fastifyStatic, {
+  root: MEDIA_DIR,
+  prefix: '/media/'
+})
 
 // -------------------------
 // HELPERS
@@ -118,7 +159,9 @@ async function saveIncomingMedia(
     mediaObj = msg.message.stickerMessage
   }
 
-  if (!mediaType || !mediaObj) return null
+  if (!mediaType || !mediaObj) {
+    return null
+  }
 
   const stream = await downloadContentFromMessage(mediaObj, mediaType)
   const chunks: Buffer[] = []
@@ -131,31 +174,19 @@ async function saveIncomingMedia(
   const absPath = path.join(MEDIA_DIR, filename)
   fs.writeFileSync(absPath, buf)
 
-  const publicUrl = `${PUBLIC_BASE_URL.replace(/\/$/, '')}/media/${filename}`
-  return { filename, mimeType, url: publicUrl }
+  const url = `${PUBLIC_BASE_URL}/media/${filename}`
+  return { filename, mimeType, url }
 }
 
-function simplifyBaileysMessage(m: any) {
-  const fromMe = m.key?.fromMe === true
-  const text =
-    m.message?.conversation ||
-    m.message?.extendedTextMessage?.text ||
-    m.message?.imageMessage?.caption ||
-    m.message?.videoMessage?.caption ||
-    m.message?.documentMessage?.caption ||
-    ''
-
-  const messageId = m.key?.id || ''
-  const tsMs = Number(m.messageTimestamp || 0) * 1000
-
-  return {
-    messageId,
-    fromMe,
-    text,
-    mediaUrl: null,
-    mediaMime: null,
-    timestampMs: tsMs,
-  }
+function isRestartRequired(err: any) {
+  const code = Number(
+    err?.output?.statusCode ??
+    err?.status ??
+    err?.code ??
+    err?.statusCode ??
+    0
+  )
+  return code === 515 || code === DisconnectReason.restartRequired
 }
 
 async function sendWebhookEvent(
@@ -167,15 +198,17 @@ async function sendWebhookEvent(
     app.log.warn({ msg: 'no webhookUrl for session, drop event', sessionId: s.id, event })
     return
   }
-
   const signature = s.webhookSecret || WEBHOOK_SECRET || ''
   const body = { sessionId: s.id, event, ...payload }
 
   try {
     const res = await fetch(s.webhookUrl, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-wa-signature': signature },
-      body: JSON.stringify(body),
+      headers: {
+        'Content-Type': 'application/json',
+        'x-wa-signature': signature
+      },
+      body: JSON.stringify(body)
     })
     app.log.info({ webhookPush: { sessionId: s.id, event, status: res.status } })
   } catch (e: any) {
@@ -183,28 +216,56 @@ async function sendWebhookEvent(
   }
 }
 
-function isRestartRequired(err: any) {
-  const code = Number(
-    err?.output?.statusCode ?? err?.status ?? err?.code ?? err?.statusCode ?? 0
-  )
-  return code === 515 || code === DisconnectReason.restartRequired
+// -------------------------
+// BAILEYS HANDLERS
+// -------------------------
+
+// keep chat list updated without makeInMemoryStore
+function wireChatContactStores(s: SessionState, sock: ReturnType<typeof makeWASocket>) {
+  const setChats = (arr: any[]) => {
+    for (const c of arr || []) {
+      const existing = s.chats.get(c.id) || { id: c.id }
+      s.chats.set(c.id, {
+        ...existing,
+        id: c.id,
+        name: c.name ?? existing.name ?? null,
+        subject: c.subject ?? existing.subject ?? null,
+        conversationTimestamp: c.conversationTimestamp ?? existing.conversationTimestamp ?? null
+      })
+    }
+  }
+
+  sock.ev.on('chats.set', (data: any) => {
+    setChats(data?.chats || [])
+  })
+  sock.ev.on('chats.upsert', (arr: any[]) => setChats(arr))
+  sock.ev.on('chats.update', (updates: any[]) => {
+    for (const u of updates || []) {
+      const existing = s.chats.get(u.id) || { id: u.id }
+      s.chats.set(u.id, { ...existing, ...u })
+    }
+  })
+
+  sock.ev.on('contacts.upsert', (arr: any[]) => {
+    for (const c of arr || []) {
+      const jid = c.id
+      s.contacts.set(jid, { notify: c.notify, name: c.name })
+      // if we have a chat with the same id, we can set a friendlier name
+      const chat = s.chats.get(jid)
+      if (chat && !chat.name && (c.notify || c.name)) {
+        chat.name = c.notify || c.name
+        s.chats.set(jid, chat)
+      }
+    }
+  })
 }
 
-
-// -------------------------
-// HANDLERS BAILEYS
-// -------------------------
 async function onConnectionUpdate(s: SessionState, u: any) {
   app.log.info({ wa_update: { conn: u.connection, hasQR: !!u.qr, disc: !!u.lastDisconnect } })
 
   if (u.qr) {
     s.qr_text = u.qr
-    try {
-      s.qr = await QRCode.toDataURL(u.qr)
-    } catch (e) {
-      s.qr = null
-      app.log.warn({ msg: 'qr toDataURL failed', err: String(e) })
-    }
+    try { s.qr = await QRCode.toDataURL(u.qr) } catch { s.qr = null }
   }
 
   if (u.connection === 'open') {
@@ -221,7 +282,7 @@ async function onConnectionUpdate(s: SessionState, u: any) {
 
     await sendWebhookEvent(s, 'session.connected', {
       data: { meId: s.meId || null, phoneNumber: s.meNumber || null },
-      ts: Date.now(),
+      ts: Date.now()
     })
     return
   }
@@ -244,11 +305,10 @@ async function onConnectionUpdate(s: SessionState, u: any) {
 
       await sendWebhookEvent(s, 'session.disconnected', {
         data: { reason: 'loggedOut' },
-        ts: Date.now(),
+        ts: Date.now()
       })
       return
     }
-
     s.connected = false
   }
 }
@@ -269,11 +329,27 @@ async function onMessagesUpsert(s: SessionState, m: any) {
     msg.message?.documentMessage?.caption ||
     ''
 
-  const mediaInfo = await saveIncomingMedia(msg)
+  const mediaInfo = await saveIncomingMedia(msg) // may be null
 
-  await sendWebhookEvent(s, 'message.in', {
-    data: { from: chatNumber || remoteJid, fromJid: remoteJid, fromMe, text, media: mediaInfo },
-    ts: Date.now(),
+  // update chat timestamp for sorting
+  const chat = s.chats.get(remoteJid) || { id: remoteJid }
+  const tsSec = Number(msg.messageTimestamp || 0) // seconds
+  chat.conversationTimestamp = tsSec
+  s.chats.set(remoteJid, chat)
+
+  // choose event name depending on direction
+  const eventName = fromMe ? 'message.out' : 'message.in'
+
+  await sendWebhookEvent(s, eventName, {
+    data: {
+      from: chatNumber || remoteJid,
+      fromJid: remoteJid,
+      fromMe,
+      text,
+      media: mediaInfo || null,
+      timestampMs: tsSec * 1000
+    },
+    ts: Date.now()
   })
 }
 
@@ -281,17 +357,17 @@ function attachSocketHandlers(s: SessionState, sock: ReturnType<typeof makeWASoc
   if (s.saveCreds) sock.ev.on('creds.update', s.saveCreds)
   sock.ev.on('connection.update', async (u) => onConnectionUpdate(s, u))
   sock.ev.on('messages.upsert', async (m) => onMessagesUpsert(s, m))
+  wireChatContactStores(s, sock)
 }
 
-
 // -------------------------
-// CYCLE DE VIE D'UNE SESSION
+// SESSION LIFECYCLE
 // -------------------------
 async function restartSession(id: string) {
   const s = sessions.get(id)
   if (!s) return
 
-  app.log.warn({ msg: 'restart WA session (515)', id })
+  app.log.warn({ msg: 'restart WA session', id })
 
   try { (s.sock as any)?.ev?.removeAllListeners?.() } catch {}
   try { (s.sock as any)?.ws?.close?.() } catch {}
@@ -310,13 +386,9 @@ async function restartSession(id: string) {
     printQRInTerminal: false,
     browser: ['Zuria', 'Chrome', '120.0.0.0'],
     connectTimeoutMs: 60_000,
-    defaultQueryTimeoutMs: 60_000,
+    defaultQueryTimeoutMs: 60_000
   })
   s.sock = sock
-
-  const store = makeInMemoryStore({})
-  store.bind(sock.ev)
-  s.store = store
 
   attachSocketHandlers(s, sock)
 }
@@ -336,6 +408,8 @@ async function startSession(id: string) {
     phoneNumber: null,
     meId: null,
     meNumber: null,
+    chats: new Map(),
+    contacts: new Map()
   }
 
   const sock = makeWASocket({
@@ -344,63 +418,51 @@ async function startSession(id: string) {
     printQRInTerminal: false,
     browser: ['Zuria', 'Chrome', '120.0.0.0'],
     connectTimeoutMs: 60_000,
-    defaultQueryTimeoutMs: 60_000,
+    defaultQueryTimeoutMs: 60_000
   })
   s.sock = sock
 
-  const store = makeInMemoryStore({})
-  store.bind(sock.ev)
-  s.store = store
-
   sessions.set(id, s)
   attachSocketHandlers(s, sock)
+
   return s
 }
 
+// -------------------------
+// ROUTES
+// -------------------------
 
-// -------------------------
-// ROUTES HTTP
-// -------------------------
+// Tiny dashboard (debug)
 app.get('/', async (_req, reply) => {
   const html = `
   <html>
     <head><meta charset="utf-8"><title>Zuria WA</title></head>
     <body style="font-family: system-ui; max-width: 720px; margin: 40px auto;">
       <h2>Zuria WhatsApp Gateway</h2>
-
       <button onclick="createSession()">Créer une session</button>
-
       <div id="out" style="margin-top:16px"></div>
-
       <script>
       async function createSession(){
         const r = await fetch('/sessions', {method:'POST'})
         const j = await r.json()
-
         const out = document.getElementById('out')
         out.innerHTML = '<p><b>Session:</b> '+j.session_id+'</p>'
                        + '<img id="qr" style="width:300px;border:1px solid #ccc"/>'
                        + '<div id="stat"></div>'
-
         const img = document.getElementById('qr')
         const stat = document.getElementById('stat')
-
         const interval = setInterval(async ()=>{
           const r2 = await fetch('/sessions/'+j.session_id)
           const s = await r2.json()
-
-          if(s.qr){
-            img.src = s.qr
-          } else if (s.qr_text) {
-            img.src = 'https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=' + encodeURIComponent(s.qr_text)
+          if(s.qr){ img.src = s.qr }
+          else if (s.qr_text) {
+            img.src = 'https://api.qrserver.com/v1/create-qr-code/?size=300x300&data='
+                      + encodeURIComponent(s.qr_text)
           }
-
-          stat.textContent = s.connected ? '✅ Connecté ('+(s.phoneNumber||'???')+')' : '⏳ En attente...'
-
-          if(s.connected){
-            clearInterval(interval)
-            img.remove()
-          }
+          stat.textContent = s.connected
+            ? '✅ Connecté ('+(s.phoneNumber||'???')+')'
+            : '⏳ En attente...'
+          if(s.connected){ clearInterval(interval); img.remove() }
         }, 1500)
       }
       </script>
@@ -409,58 +471,42 @@ app.get('/', async (_req, reply) => {
   reply.type('text/html').send(html)
 })
 
+// send test page
 app.get('/send', async (_req, reply) => {
   const html = `
   <html>
     <head><meta charset="utf-8"><title>Envoyer un message</title></head>
     <body style="font-family: system-ui; max-width: 700px; margin: 40px auto;">
       <h2>Envoyer un message WhatsApp</h2>
-
-      <label>ID de session<br/>
-        <input id="sid" style="width:100%" />
-      </label>
+      <label>ID de session<br/><input id="sid" style="width:100%"/></label>
       <div style="margin:8px 0">
         <button id="check">Vérifier statut</button>
         <button id="restart">Relancer</button>
         <button id="logout">Logout complet</button>
       </div>
-
-      <label>Numéro (ex: 41760000000)<br/>
-        <input id="to" style="width:100%" placeholder="chiffres uniquement"/>
-      </label>
+      <label>Numéro (ex: 41760000000)<br/><input id="to" style="width:100%" placeholder="chiffres uniquement"/></label>
       <br/><br/>
-      <label>Message<br/>
-        <textarea id="text" style="width:100%; height:120px">Hello depuis Zuria 🚀</textarea>
-      </label>
+      <label>Message<br/><textarea id="text" style="width:100%; height:120px">Hello depuis Zuria 🚀</textarea></label>
       <br/><br/>
       <button id="btn">Envoyer</button>
-
       <pre id="out" style="background:#111;color:#0f0;padding:12px;margin-top:16px;white-space:pre-wrap;"></pre>
-
       <script>
         const out = document.getElementById('out')
-
         document.getElementById('check').onclick = async () => {
           const sid = (document.getElementById('sid').value || '').trim()
           const r = await fetch('/sessions/' + sid)
-          const j = await r.json()
-          out.textContent = JSON.stringify(j, null, 2)
+          out.textContent = JSON.stringify(await r.json(), null, 2)
         }
-
         document.getElementById('restart').onclick = async () => {
           const sid = (document.getElementById('sid').value || '').trim()
           const r = await fetch('/sessions/' + sid + '/restart', { method: 'POST' })
-          const j = await r.json()
-          out.textContent = JSON.stringify(j, null, 2)
+          out.textContent = JSON.stringify(await r.json(), null, 2)
         }
-
         document.getElementById('logout').onclick = async () => {
           const sid = (document.getElementById('sid').value || '').trim()
           const r = await fetch('/sessions/' + sid + '/logout', { method: 'POST' })
-          const j = await r.json()
-          out.textContent = JSON.stringify(j, null, 2)
+          out.textContent = JSON.stringify(await r.json(), null, 2)
         }
-
         document.getElementById('btn').onclick = async () => {
           const sessionId = (document.getElementById('sid').value || '').trim()
           const to = (document.getElementById('to').value || '').trim()
@@ -472,8 +518,7 @@ app.get('/send', async (_req, reply) => {
               headers:{ 'Content-Type':'application/json' },
               body: JSON.stringify({ sessionId, to, text })
             })
-            const j = await r.json()
-            out.textContent = JSON.stringify(j, null, 2)
+            out.textContent = JSON.stringify(await r.json(), null, 2)
           } catch (e) {
             out.textContent = 'Erreur: ' + e
           }
@@ -484,14 +529,16 @@ app.get('/send', async (_req, reply) => {
   reply.type('text/html').send(html)
 })
 
+// create session
 app.post('/sessions', async (_req, reply) => {
   const id = uuid()
   app.log.info({ msg: 'create session', id })
-  await startSession(id)
-  await new Promise((res) => setTimeout(res, 500))
-  return reply.send({ session_id: id })
+  const s = await startSession(id)
+  await new Promise(res => setTimeout(res, 500))
+  return reply.send({ session_id: s.id })
 })
 
+// get session state
 app.get('/sessions/:id', async (req, reply) => {
   const id = (req.params as any).id
   const s = sessions.get(id)
@@ -505,19 +552,20 @@ app.get('/sessions/:id', async (req, reply) => {
     phoneNumber: s.phoneNumber || null,
     meNumber: s.meNumber || null,
     meId: s.meId || null,
-    hasSock: !!s.sock,
+    hasSock: !!s.sock
   })
 })
 
+// restart WA socket
 app.post('/sessions/:id/restart', async (req, reply) => {
   const id = (req.params as any).id
   const s = sessions.get(id)
   if (!s) return reply.code(404).send({ error: 'unknown session' })
-
   await restartSession(id)
   return reply.send({ ok: true })
 })
 
+// register webhook
 app.post('/sessions/:id/webhook', async (req, reply) => {
   const id = (req.params as any).id
   const s = sessions.get(id)
@@ -532,6 +580,7 @@ app.post('/sessions/:id/webhook', async (req, reply) => {
   return reply.send({ ok: true, session_id: id, webhookUrl: s.webhookUrl })
 })
 
+// send message
 app.post('/messages', async (req, reply) => {
   if (API_KEY) {
     const hdr = req.headers['x-api-key']
@@ -547,12 +596,13 @@ app.post('/messages', async (req, reply) => {
 
   await sendWebhookEvent(s, 'message.out', {
     data: { to: jid, text: String(text || '') },
-    ts: Date.now(),
+    ts: Date.now()
   })
 
   return reply.send({ ok: true })
 })
 
+// paginated chats (from our minimal in-memory store)
 app.get('/sessions/:id/chats', async (req, reply) => {
   const id = (req.params as any).id
   const s = sessions.get(id)
@@ -565,44 +615,38 @@ app.get('/sessions/:id/chats', async (req, reply) => {
 
   const q = (req.query as any) || {}
   const limit = Math.min(Number(q.limit || 20), 50)
-  const beforeTs = Number(q.beforeTs || 0)
+  const beforeTs = Number(q.beforeTs || 0) // ms
 
-  let rawChats: any[] = []
-  if (s.store && (s.store as any).chats) {
-    const ch: any = (s.store as any).chats
-    if (typeof ch.values === 'function') rawChats = Array.from(ch.values())
-    else if (ch instanceof Map) rawChats = Array.from(ch.values())
-    else if (Array.isArray(ch)) rawChats = ch
-  }
+  const raw = Array.from(s.chats.values())
 
-  const sorted = rawChats.sort((a: any, b: any) => {
+  // sort by latest conversationTimestamp (baileys stores seconds)
+  const sorted = raw.sort((a, b) => {
     const ta = Number(a.conversationTimestamp || 0)
     const tb = Number(b.conversationTimestamp || 0)
     return tb - ta
   })
 
-  const filtered =
-    beforeTs > 0
-      ? sorted.filter((c: any) => Number(c.conversationTimestamp || 0) * 1000 < beforeTs)
-      : sorted
+  const filtered = beforeTs > 0
+    ? sorted.filter(c => Number(c.conversationTimestamp || 0) * 1000 < beforeTs)
+    : sorted
 
   const page = filtered.slice(0, limit)
 
-  const chats = page.map((chat: any) => ({
+  const chats = page.map(chat => ({
     chatJid: chat.id,
     chatNumber: extractPhoneFromJid(chat.id),
     chatName: chat.name || chat.subject || null,
-    lastTsMs: Number(chat.conversationTimestamp || 0) * 1000,
+    lastTsMs: Number(chat.conversationTimestamp || 0) * 1000
   }))
 
-  const nextBeforeTs =
-    page.length > 0
-      ? Number(page[page.length - 1].conversationTimestamp || 0) * 1000
-      : null
+  const nextBeforeTs = page.length > 0
+    ? Number(page[page.length - 1].conversationTimestamp || 0) * 1000
+    : null
 
   return reply.send({ ok: true, chats, nextBeforeTs })
 })
 
+// paginated messages for a chat
 app.get('/sessions/:id/chats/:jid/messages', async (req, reply) => {
   const { id, jid } = (req.params as any)
   const s = sessions.get(id)
@@ -621,10 +665,9 @@ app.get('/sessions/:id/chats/:jid/messages', async (req, reply) => {
   if (q.beforeFromMe === 'true' || q.beforeFromMe === true) beforeFromMe = true
   else if (q.beforeFromMe === 'false' || q.beforeFromMe === false) beforeFromMe = false
 
-  const cursor =
-    beforeId && typeof beforeFromMe === 'boolean'
-      ? { id: beforeId, fromMe: beforeFromMe, remoteJid: jid }
-      : undefined
+  const cursor = (beforeId && typeof beforeFromMe === 'boolean')
+    ? { id: beforeId, fromMe: beforeFromMe, remoteJid: jid }
+    : undefined
 
   let rawMsgs: any[] = []
   try {
@@ -633,13 +676,34 @@ app.get('/sessions/:id/chats/:jid/messages', async (req, reply) => {
     return reply.code(500).send({ error: 'loadMessages failed', detail: String(e) })
   }
 
-  const messages = rawMsgs.map(simplifyBaileysMessage)
+  const messages = rawMsgs.map((m: any) => {
+    const fromMe = m.key?.fromMe === true
+    const text =
+      m.message?.conversation ||
+      m.message?.extendedTextMessage?.text ||
+      m.message?.imageMessage?.caption ||
+      m.message?.videoMessage?.caption ||
+      m.message?.documentMessage?.caption ||
+      ''
+    const messageId = m.key?.id || ''
+    const tsMs = Number(m.messageTimestamp || 0) * 1000
+    return {
+      messageId,
+      fromMe,
+      text,
+      mediaUrl: null,
+      mediaMime: null,
+      timestampMs: tsMs
+    }
+  })
+
   const last = messages[messages.length - 1]
   const nextCursor = last ? { beforeId: last.messageId, beforeFromMe: last.fromMe } : null
 
   return reply.send({ ok: true, messages, nextCursor })
 })
 
+// full logout + purge credentials
 app.post('/sessions/:id/logout', async (req, reply) => {
   const id = (req.params as any).id
   const s = sessions.get(id)
@@ -653,7 +717,7 @@ app.post('/sessions/:id/logout', async (req, reply) => {
 
   await sendWebhookEvent(s, 'session.disconnected', {
     data: { reason: 'manual_logout' },
-    ts: Date.now(),
+    ts: Date.now()
   })
 
   try { (s.sock as any)?.ev?.removeAllListeners?.() } catch {}
@@ -673,10 +737,12 @@ app.post('/sessions/:id/logout', async (req, reply) => {
   return reply.send({ ok: true, loggedOut: true })
 })
 
-app.get('/health', async (_req, reply) => {
-  reply.send({ ok: true })
-})
+// health
+app.get('/health', async (_req, reply) => reply.send({ ok: true }))
 
+// -------------------------
+// START
+// -------------------------
 app.listen({ port: PORT, host: '0.0.0.0' }).then(() => {
   app.log.info(`HTTP server listening on ${PORT}`)
 })
