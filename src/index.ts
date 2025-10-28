@@ -94,7 +94,13 @@ app.addContentTypeParser('application/json', { parseAs: 'string' }, (req, body, 
 
 // prefix fallback: allow /api/* to hit same handlers
 app.addHook('onRequest', (req, _reply, done) => {
-  if (req.url.startsWith('/api/')) req.url = req.url.slice(4)
+  if (req.url.startsWith('/api/')) {
+    // Fastify autorise techniquement de réécrire req.url,
+    // mais le type TS marque req.url comme readonly.
+    // On force l'override pour supporter /api/... sur Render.
+    // @ts-ignore
+    req.url = req.url.slice(4)
+  }
   done()
 })
 
@@ -464,7 +470,7 @@ app.get('/', async (_req, reply) => {
   reply.type('text/html').send(html)
 })
 
-// send test page
+// test UI for send
 app.get('/send', async (_req, reply) => {
   const html = `
   <html>
@@ -559,6 +565,7 @@ app.post('/sessions/:id/restart', async (req, reply) => {
 })
 
 // register webhook
+// body: { url: "https://....?session=xxx", secret?: "..." }
 app.post('/sessions/:id/webhook', async (req, reply) => {
   const id = (req.params as any).id
   const s = sessions.get(id)
@@ -595,7 +602,7 @@ app.post('/messages', async (req, reply) => {
   return reply.send({ ok: true })
 })
 
-// paginated chats
+// paginated chats (for sidebar Live WhatsApp)
 app.get('/sessions/:id/chats', async (req, reply) => {
   const id = (req.params as any).id
   const s = sessions.get(id)
@@ -638,7 +645,7 @@ app.get('/sessions/:id/chats', async (req, reply) => {
   return reply.send({ ok: true, chats, nextBeforeTs })
 })
 
-// paginated messages for a chat
+// paginated messages in a given chat
 app.get('/sessions/:id/chats/:jid/messages', async (req, reply) => {
   const { id, jid } = (req.params as any)
   const s = sessions.get(id)
