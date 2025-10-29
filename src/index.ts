@@ -225,7 +225,7 @@ async function sendWebhookEvent(
   }
 }
 
-// envoi avec pacing/queue par session
+// envoi avec pacing/queue par session (anti-ban)
 async function enqueueSend(s: SessionState, task: () => Promise<void>) {
   s.queue.push(task)
   if (!s.sending) {
@@ -238,7 +238,7 @@ async function enqueueSend(s: SessionState, task: () => Promise<void>) {
         s.sentInCurrentMinute = 0
       }
       if (s.sentInCurrentMinute >= SEND_MAX_PER_MINUTE) {
-        await new Promise(r => setTimeout(r, 1000)) // attendre 1s et re-check
+        await new Promise(r => setTimeout(r, 1000))
         continue
       }
 
@@ -318,10 +318,19 @@ function wireChatContactStores(s: SessionState, sock: ReturnType<typeof makeWASo
     if (Array.isArray(messages)) {
       for (const m of messages) {
         const k = mkMsgKey(m.key)
-        if (k) s.messageStore.set(k, m.message)
+        if (k) {
+          s.messageStore.set(k, m.message)
+        }
       }
     }
-    app.log.info({ msg: 'history.sync', id: s.id, syncType, chats: chats?.length, contacts: contacts?.length, messages: messages?.length })
+    app.log.info({
+      msg: 'history.sync',
+      id: s.id,
+      syncType,
+      chats: chats?.length,
+      contacts: contacts?.length,
+      messages: messages?.length
+    })
   })
 }
 
@@ -336,7 +345,9 @@ async function onMessagesUpsert(s: SessionState, up: any) {
     const chatNumber = extractPhoneFromJid(remoteJid)
 
     const storeKey = mkMsgKey(msg.key)
-    if (storeKey) s.messageStore.set(storeKey, msg.message)
+    if (storeKey) {
+      s.messageStore.set(storeKey, msg.message)
+    }
 
     const text =
       msg.message?.conversation ||
@@ -427,7 +438,6 @@ async function pushInitialHistorySeed(s: SessionState) {
         lastTsMs = Number(m.messageTimestamp || 0) * 1000
       }
     } catch {}
-
     items.push({
       chatJid: c.id,
       chatNumber: extractPhoneFromJid(c.id),
@@ -438,7 +448,7 @@ async function pushInitialHistorySeed(s: SessionState) {
   }
 
   await sendWebhookEvent(s, 'bootstrap.history', {
-    data: { items }, // l’Edge Function crée/actualise conversations/messages pour “remplir” l’UI
+    data: { items },
     ts: Date.now()
   })
 }
@@ -479,7 +489,9 @@ async function onConnectionUpdate(s: SessionState, u: any) {
     })
 
     // seed initial: 10 conversations (évite l'effet vide)
-    setTimeout(() => pushInitialHistorySeed(s).catch(() => {}), 3000)
+    setTimeout(() => {
+      pushInitialHistorySeed(s).catch(() => {})
+    }, 3000)
     return
   }
 
@@ -531,14 +543,15 @@ async function buildSocket(s: SessionState) {
 
     // cache group metadata pour limiter les fetchs
     cachedGroupMetadata: async (jid: string) => {
-      let md = s.groupCache.get(jid)
+      // >>> FIX TYPESCRIPT: force any pour ne pas renvoyer unknown
+      let md: any = s.groupCache.get(jid) as any
       if (!md && s.sock) {
         try {
           md = await s.sock.groupMetadata(jid)
           if (md) s.groupCache.set(jid, md, 3600)
         } catch {}
       }
-      return md
+      return md as any
     },
 
     connectTimeoutMs: 60_000,
@@ -598,7 +611,7 @@ async function startSession(id: string) {
   // secret par session (HMAC)
   s.webhookSecret = crypto.randomBytes(32).toString('hex')
 
-  // si on connaît déjà l’Edge Function → URL unique par session (phone ajouté plus tard)
+  // URL webhook de base (sans numéro tant qu'on ne connaît pas encore le phone)
   if (SUPABASE_WEBHOOK_URL) {
     s.webhookUrl = `${SUPABASE_WEBHOOK_URL}?sessionId=${encodeURIComponent(s.id)}`
   }
@@ -724,7 +737,7 @@ app.post('/sessions', async (_req, reply) => {
     s.webhookUrl = `${SUPABASE_WEBHOOK_URL}?sessionId=${encodeURIComponent(s.id)}`
   }
 
-  // notify backend pour créer la ligne whatsapp_sessions si tu veux centraliser côté Edge Function
+  // notify backend pour créer la ligne whatsapp_sessions côté Supabase
   await sendWebhookEvent(s, 'session.created', {
     data: { sessionId: s.id },
     ts: Date.now()
@@ -789,11 +802,17 @@ app.post('/messages', async (req, reply) => {
 
   const jid = `${String(to).replace(/[^\d]/g, '')}@s.whatsapp.net`
 
+  // on wrappe dans enqueueSend pour respecter le pacing
   await new Promise<void>((res, rej) => {
     enqueueSend(s, async () => {
       const resMsg = await s.sock!.sendMessage(jid, { text: String(text || '') })
+
       const k = mkMsgKey(resMsg?.key)
-      if (k) s.messageStore.set(k, resMsg?.message)
+      if (k) {
+        // FIX TYPESCRIPT: si jamais resMsg?.message vaut null, on le force à undefined
+        const safeMessage = (resMsg as any)?.message ?? undefined
+        s.messageStore.set(k, safeMessage)
+      }
 
       await sendWebhookEvent(s, 'message.out', {
         data: { to: jid, text: String(text || ''), key: resMsg?.key },
@@ -891,7 +910,9 @@ app.get('/sessions/:id/chats/:jid/messages', async (req, reply) => {
     const tsMs = Number(m.messageTimestamp || 0) * 1000
 
     const k = mkMsgKey(m.key)
-    if (k) s.messageStore.set(k, m.message)
+    if (k) {
+      s.messageStore.set(k, m.message)
+    }
 
     return {
       messageId,
@@ -961,11 +982,8 @@ async function bootstrap() {
 bootstrap()
 
 /**
- * Points clés:
- * - Webhook auto par session (SUPABASE_WEBHOOK_URL), secret HMAC par session.
- * - Events: session.created/connected/disconnected, message.in/out, bootstrap.history, ...
- * - syncFullHistory + Desktop UA => seed 10 convos au connect.
- * - getMessage + logger (requis/recommandés Baileys).
- * - Queue d'envoi + pacing (anti-ban).
- * - ⚠️ useMultiFileAuthState: OK en MVP; prévoir un store DB/Redis en prod.
+ * Fixes par rapport à la build Render qui a échoué :
+ * - cachedGroupMetadata: cast explicite en `any` pour ne plus retourner `unknown`.
+ * - messageStore.set(...) : on convertit `null` éventuel en `undefined` avant set().
+ * Tout le reste (webhook HMAC, pacing anti-ban, seed 10 convos) reste identique.
  */
