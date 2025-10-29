@@ -1,8 +1,5 @@
 // src/index.ts
 
-// -------------------------
-// IMPORTS
-// -------------------------
 import Fastify from 'fastify'
 import fastifyStatic from '@fastify/static'
 import cors from '@fastify/cors'
@@ -13,7 +10,7 @@ import pino from 'pino'
 import NodeCache from 'node-cache'
 
 import makeWASocket, {
-  useMultiFileAuthState,              // ⚠️ MVP. Prévoir store DB/Redis en prod.
+  useMultiFileAuthState,
   DisconnectReason,
   downloadContentFromMessage,
   Browsers,
@@ -25,21 +22,20 @@ import fs from 'fs'
 import path from 'path'
 
 // -------------------------
-// CONFIG
+// CONFIG (vient de Render env vars)
 // -------------------------
 const PORT = parseInt(process.env.PORT || '3001', 10)
 const AUTH_DIR = process.env.AUTH_DIR || './.wa'
 const MEDIA_DIR = process.env.MEDIA_DIR || path.join(AUTH_DIR, 'media')
 const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || process.env.RENDER_EXTERNAL_URL || 'https://zuria-wa.onrender.com').replace(/\/$/, '')
 
-const WEBHOOK_SECRET_FALLBACK = process.env.WEBHOOK_SECRET || ''
-const SUPABASE_WEBHOOK_URL = process.env.SUPABASE_WEBHOOK_URL || ''   // Edge Function cible
+const WEBHOOK_SECRET_FALLBACK = process.env.WEBHOOK_SECRET || '' // secret global (shared avec Supabase)
+const SUPABASE_WEBHOOK_URL = process.env.SUPABASE_WEBHOOK_URL || '' // l’URL de l’Edge Function Supabase
 const API_KEY = process.env.API_KEY || ''
 
 const MARK_ONLINE = (process.env.WA_MARK_ONLINE || 'false').toLowerCase() === 'true'
 const FULL_HISTORY = (process.env.WA_FULL_HISTORY || 'true').toLowerCase() !== 'false'
 
-// Anti-ban pacing
 const SEND_MIN_INTERVAL_MS = Math.max(0, parseInt(process.env.SEND_MIN_INTERVAL_MS || '1500', 10))
 const SEND_MAX_PER_MINUTE = Math.max(1, parseInt(process.env.SEND_MAX_PER_MINUTE || '20', 10))
 const SEND_JITTER_MS = Math.max(0, parseInt(process.env.SEND_JITTER_MS || '400', 10))
@@ -51,41 +47,32 @@ type ChatLite = {
   id: string
   name?: string | null
   subject?: string | null
-  conversationTimestamp?: number | null // seconds since epoch (Baileys)
+  conversationTimestamp?: number | null // seconds since epoch
 }
 
 type SessionState = {
   id: string
 
-  // QR for UI
   qr?: string | null
   qr_text?: string | null
 
-  // connection
   connected: boolean
 
-  // Baileys socket
   sock?: ReturnType<typeof makeWASocket>
-
-  // creds persist
   saveCreds?: () => Promise<void>
 
-  // per-session webhook (unique)
-  webhookUrl?: string
-  webhookSecret?: string
+  webhookUrl?: string         // URL Supabase ciblée pour CETTE session
+  webhookSecret?: string      // secret unique de cette session
 
-  // account info
   meId?: string | null
   meNumber?: string | null
   phoneNumber?: string | null
 
-  // minimal in-memory stores
   chats: Map<string, ChatLite>
   contacts: Map<string, { notify?: string; name?: string }>
   messageStore: Map<string, proto.IMessage | undefined>
   groupCache: NodeCache
 
-  // pacing / queue
   queue: Array<() => Promise<void>>
   sending: boolean
   lastMinuteWindowStart: number
@@ -95,7 +82,7 @@ type SessionState = {
 const sessions = new Map<string, SessionState>()
 
 // -------------------------
-// FASTIFY INSTANCE
+// FASTIFY APP
 // -------------------------
 const app = Fastify({ logger: true })
 
@@ -191,14 +178,14 @@ function mkMsgKey(key?: WAMessageKey): string | null {
   return `${key.id}|${key.remoteJid}`
 }
 
-// HMAC SHA-256 (secret + body)
+// HMAC SHA-256 signature
 function hmacSha256Hex(secret: string, body: string) {
   return crypto.createHmac('sha256', secret).update(body).digest('hex')
 }
 
-// >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-// sendWebhookEvent (PATCHÉ)
-// >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+// -------------------------
+// sendWebhookEvent
+// -------------------------
 async function sendWebhookEvent(
   s: SessionState,
   event: string,
@@ -209,9 +196,9 @@ async function sendWebhookEvent(
     return
   }
 
-  // special case: le tout premier event "session.created"
-  // On signe avec le secret global fallback (WEBHOOK_SECRET_FALLBACK),
-  // et on envoie aussi le vrai secret de session dans le body pour que Supabase l'enregistre.
+  // Premier event (session.created):
+  // - signé avec le secret global fallback WEBHOOK_SECRET_FALLBACK
+  // - on inclut le secret unique de la session dans le body
   const isBootstrap = event === 'session.created'
 
   const secretToUse = isBootstrap
@@ -243,14 +230,15 @@ async function sendWebhookEvent(
     app.log.error({ msg: 'webhook push failed', sessionId: s.id, event, err: String(e) })
   }
 }
-// >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
 
+// -------------------------
+// Queue d'envoi (anti-ban)
+// -------------------------
 async function enqueueSend(s: SessionState, task: () => Promise<void>) {
   s.queue.push(task)
   if (!s.sending) {
     s.sending = true
     while (s.queue.length) {
-      // rate limit par minute
       const now = Date.now()
       if (now - s.lastMinuteWindowStart >= 60_000) {
         s.lastMinuteWindowStart = now
@@ -261,7 +249,6 @@ async function enqueueSend(s: SessionState, task: () => Promise<void>) {
         continue
       }
 
-      // délai mini + jitter
       const jitter = Math.floor(Math.random() * (SEND_JITTER_MS + 1))
       await new Promise(r => setTimeout(r, SEND_MIN_INTERVAL_MS + jitter))
 
@@ -278,7 +265,7 @@ async function enqueueSend(s: SessionState, task: () => Promise<void>) {
 }
 
 // -------------------------
-// BAILEYS HANDLERS
+// Baileys handlers: chats/contacts/messages
 // -------------------------
 function ensureChat(id: string): ChatLite {
   return { id, name: null, subject: null, conversationTimestamp: null }
@@ -376,9 +363,8 @@ async function onMessagesUpsert(s: SessionState, up: any) {
       msg.message?.documentMessage?.caption ||
       ''
 
-    const mediaInfo = await saveIncomingMedia(msg).catch(() => null) // may be null
+    const mediaInfo = await saveIncomingMedia(msg).catch(() => null)
 
-    // update chat timestamp
     const base = s.chats.get(remoteJid) ?? ensureChat(remoteJid)
     const tsSec = Number(msg.messageTimestamp || 0)
     s.chats.set(remoteJid, { ...base, conversationTimestamp: tsSec })
@@ -433,8 +419,10 @@ function attachSocketHandlers(s: SessionState, sock: ReturnType<typeof makeWASoc
   wireChatContactStores(s, sock)
 }
 
+// -------------------------
+// Seed des 10 conversations récentes
+// -------------------------
 async function pushInitialHistorySeed(s: SessionState) {
-  // prendre les 10 chats les plus récents
   const chats = Array.from(s.chats.values())
     .sort((a, b) => (Number(b.conversationTimestamp || 0) - Number(a.conversationTimestamp || 0)))
     .slice(0, 10)
@@ -472,13 +460,16 @@ async function pushInitialHistorySeed(s: SessionState) {
   })
 }
 
+// -------------------------
+// Connexion / déconnexion
+// -------------------------
 async function onConnectionUpdate(s: SessionState, u: any) {
   app.log.info({ wa_update: { conn: u.connection, hasQR: !!u.qr, disc: !!u.lastDisconnect } })
 
   if (u.qr) {
     s.qr_text = u.qr
     try { s.qr = await QRCode.toDataURL(u.qr) } catch { s.qr = null }
-    // informer le backend qu'une session est “created/pending”
+
     await sendWebhookEvent(s, 'session.created', {
       data: { sessionId: s.id, qr: s.qr || null, qr_text: s.qr_text || null },
       ts: Date.now()
@@ -496,9 +487,10 @@ async function onConnectionUpdate(s: SessionState, u: any) {
       s.meNumber = num || null
       s.phoneNumber = s.meNumber || null
 
-      // webhook URL unique par session + numéro (si dispo)
+      // ⚠️ CHANGEMENT ICI : snake_case "session_id"
       if (SUPABASE_WEBHOOK_URL) {
-        s.webhookUrl = `${SUPABASE_WEBHOOK_URL}?sessionId=${encodeURIComponent(s.id)}&phone=${encodeURIComponent(s.phoneNumber || '')}`
+        s.webhookUrl =
+          `${SUPABASE_WEBHOOK_URL}?session_id=${encodeURIComponent(s.id)}&phone=${encodeURIComponent(s.phoneNumber || '')}`
       }
     }
 
@@ -507,7 +499,6 @@ async function onConnectionUpdate(s: SessionState, u: any) {
       ts: Date.now()
     })
 
-    // seed initial: 10 conversations (évite l'effet vide)
     setTimeout(() => {
       pushInitialHistorySeed(s).catch(() => {})
     }, 3000)
@@ -541,7 +532,7 @@ async function onConnectionUpdate(s: SessionState, u: any) {
 }
 
 // -------------------------
-// SESSION LIFECYCLE
+// Lifecycle d'une session
 // -------------------------
 async function buildSocket(s: SessionState) {
   const waLogger = pino({ level: process.env.WA_LOG_LEVEL || 'info', name: `wa:${s.id}` })
@@ -554,15 +545,12 @@ async function buildSocket(s: SessionState) {
     markOnlineOnConnect: MARK_ONLINE,
     printQRInTerminal: false,
 
-    // requis par Baileys (resend, polls)
     getMessage: async (key: WAMessageKey) => {
       const k = mkMsgKey(key)
       return k ? s.messageStore.get(k) : undefined
     },
 
-    // cache group metadata pour limiter les fetchs
     cachedGroupMetadata: async (jid: string) => {
-      // Typescript: NodeCache.get() renvoie unknown → on cast en any
       let md: any = s.groupCache.get(jid) as any
       if (!md && s.sock) {
         try {
@@ -627,12 +615,13 @@ async function startSession(id: string) {
   }
   ;(s as any).authState = state
 
-  // secret par session (HMAC privé pour signer les futurs webhooks)
+  // secret unique par session
   s.webhookSecret = crypto.randomBytes(32).toString('hex')
 
-  // URL webhook de base (sans numéro tant qu'on ne connaît pas encore le phone)
+  // Première URL webhook au moment de la création de session : pas encore de numéro connu
+  // ⚠️ snake_case dans le query param
   if (SUPABASE_WEBHOOK_URL) {
-    s.webhookUrl = `${SUPABASE_WEBHOOK_URL}?sessionId=${encodeURIComponent(s.id)}`
+    s.webhookUrl = `${SUPABASE_WEBHOOK_URL}?session_id=${encodeURIComponent(s.id)}`
   }
 
   const sock = await buildSocket(s)
@@ -645,10 +634,9 @@ async function startSession(id: string) {
 }
 
 // -------------------------
-// ROUTES HTTP DU GATEWAY
+// ROUTES HTTP
 // -------------------------
 
-// mini-dashboard debug
 app.get('/', async (_req, reply) => {
   const html = `
   <html>
@@ -687,7 +675,6 @@ app.get('/', async (_req, reply) => {
   reply.type('text/html').send(html)
 })
 
-// UI test d’envoi
 app.get('/send', async (_req, reply) => {
   const html = `
   <html>
@@ -745,18 +732,17 @@ app.get('/send', async (_req, reply) => {
   reply.type('text/html').send(html)
 })
 
-// créer une session WhatsApp
 app.post('/sessions', async (_req, reply) => {
   const id = uuid()
   app.log.info({ msg: 'create session', id })
   const s = await startSession(id)
 
-  // webhook dès la création
+  // IMPORTANT : URL webhook à la création => snake_case session_id
   if (SUPABASE_WEBHOOK_URL) {
-    s.webhookUrl = `${SUPABASE_WEBHOOK_URL}?sessionId=${encodeURIComponent(s.id)}`
+    s.webhookUrl = `${SUPABASE_WEBHOOK_URL}?session_id=${encodeURIComponent(s.id)}`
   }
 
-  // informer Supabase (session.created)
+  // on notifie Supabase immédiatement (session.created)
   await sendWebhookEvent(s, 'session.created', {
     data: { sessionId: s.id },
     ts: Date.now()
@@ -766,7 +752,6 @@ app.post('/sessions', async (_req, reply) => {
   return reply.send({ session_id: s.id })
 })
 
-// lire état d'une session
 app.get('/sessions/:id', async (req, reply) => {
   const id = (req.params as any).id
   const s = sessions.get(id)
@@ -784,7 +769,6 @@ app.get('/sessions/:id', async (req, reply) => {
   })
 })
 
-// relancer la session
 app.post('/sessions/:id/restart', async (req, reply) => {
   const id = (req.params as any).id
   const s = sessions.get(id)
@@ -793,7 +777,6 @@ app.post('/sessions/:id/restart', async (req, reply) => {
   return reply.send({ ok: true })
 })
 
-// configurer (ou reconfigurer) le webhook manuellement
 app.post('/sessions/:id/webhook', async (req, reply) => {
   const id = (req.params as any).id
   const s = sessions.get(id)
@@ -808,7 +791,6 @@ app.post('/sessions/:id/webhook', async (req, reply) => {
   return reply.send({ ok: true, session_id: id, webhookUrl: s.webhookUrl })
 })
 
-// envoyer un message WhatsApp (passe par file d'attente anti-ban)
 app.post('/messages', async (req, reply) => {
   if (API_KEY) {
     const hdr = req.headers['x-api-key']
@@ -841,7 +823,6 @@ app.post('/messages', async (req, reply) => {
   return reply.send({ ok: true })
 })
 
-// lister les chats récents
 app.get('/sessions/:id/chats', async (req, reply) => {
   const id = (req.params as any).id
   const s = sessions.get(id)
@@ -854,7 +835,7 @@ app.get('/sessions/:id/chats', async (req, reply) => {
 
   const q = (req.query as any) || {}
   const limit = Math.min(Number(q.limit || 20), 50)
-  const beforeTs = Number(q.beforeTs || 0) // ms
+  const beforeTs = Number(q.beforeTs || 0)
 
   const raw = Array.from(s.chats.values())
 
@@ -884,7 +865,6 @@ app.get('/sessions/:id/chats', async (req, reply) => {
   return reply.send({ ok: true, chats, nextBeforeTs })
 })
 
-// lister les messages d'un chat
 app.get('/sessions/:id/chats/:jid/messages', async (req, reply) => {
   const { id, jid } = (req.params as any)
   const s = sessions.get(id)
@@ -947,7 +927,6 @@ app.get('/sessions/:id/chats/:jid/messages', async (req, reply) => {
   return reply.send({ ok: true, messages, nextCursor })
 })
 
-// logout + purge
 app.post('/sessions/:id/logout', async (req, reply) => {
   const id = (req.params as any).id
   const s = sessions.get(id)
@@ -979,11 +958,8 @@ app.post('/sessions/:id/logout', async (req, reply) => {
   return reply.send({ ok: true, loggedOut: true })
 })
 
-// health
 app.get('/health', async (_req, reply) => reply.send({ ok: true }))
 
-// -------------------------
-// BOOTSTRAP
 // -------------------------
 async function bootstrap() {
   await app.register(cors, { origin: true })
