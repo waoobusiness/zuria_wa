@@ -1,3 +1,4 @@
+// src/index.ts
 import Fastify from 'fastify'
 import fastifyStatic from '@fastify/static'
 import cors from '@fastify/cors'
@@ -21,15 +22,15 @@ import fs from 'fs'
 import path from 'path'
 
 // -------------------------
-// CONFIG (vient des vars Render)
+// CONFIG (Render env vars)
 // -------------------------
 const PORT = parseInt(process.env.PORT || '3001', 10)
 const AUTH_DIR = process.env.AUTH_DIR || './.wa'
 const MEDIA_DIR = process.env.MEDIA_DIR || path.join(AUTH_DIR, 'media')
 const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || process.env.RENDER_EXTERNAL_URL || 'https://zuria-wa.onrender.com').replace(/\/$/, '')
 
-const WEBHOOK_SECRET_FALLBACK = process.env.WEBHOOK_SECRET || '' // secret global partagé avec Supabase
-const SUPABASE_WEBHOOK_URL = process.env.SUPABASE_WEBHOOK_URL || '' // Edge Function Supabase
+const WEBHOOK_SECRET_FALLBACK = process.env.WEBHOOK_SECRET || '' // secret global partagé avec Supabase (pour session.created)
+const SUPABASE_WEBHOOK_URL = process.env.SUPABASE_WEBHOOK_URL || ''
 const API_KEY = process.env.API_KEY || ''
 
 const MARK_ONLINE = (process.env.WA_MARK_ONLINE || 'false').toLowerCase() === 'true'
@@ -40,28 +41,26 @@ const SEND_MAX_PER_MINUTE = Math.max(1, parseInt(process.env.SEND_MAX_PER_MINUTE
 const SEND_JITTER_MS = Math.max(0, parseInt(process.env.SEND_JITTER_MS || '400', 10))
 
 // -------------------------
-// TYPES & MEMORY
+// TYPES & STATE
 // -------------------------
 type ChatLite = {
   id: string
   name?: string | null
   subject?: string | null
-  conversationTimestamp?: number | null // seconds since epoch
+  conversationTimestamp?: number | null
 }
 
 type SessionState = {
   id: string
-
   qr?: string | null
   qr_text?: string | null
-
   connected: boolean
 
   sock?: ReturnType<typeof makeWASocket>
   saveCreds?: () => Promise<void>
 
-  webhookUrl?: string         // Edge Function Supabase pour CETTE session
-  webhookSecret?: string      // secret unique de cette session (HMAC)
+  webhookUrl?: string
+  webhookSecret?: string
 
   meId?: string | null
   meNumber?: string | null
@@ -85,23 +84,16 @@ const sessions = new Map<string, SessionState>()
 // -------------------------
 const app = Fastify({ logger: true })
 
-// parse JSON bodies even if empty
 app.addContentTypeParser('application/json', { parseAs: 'string' }, (req, body, done) => {
   try {
-    if (!body || (typeof body === 'string' && body.trim() === '')) {
-      done(null, {})
-      return
-    }
+    if (!body || (typeof body === 'string' && body.trim() === '')) { done(null, {}); return }
     const json = typeof body === 'string' ? JSON.parse(body) : body
     done(null, json)
-  } catch (e) {
-    done(e as any, undefined)
-  }
+  } catch (e) { done(e as any, undefined) }
 })
 
-// support /api/... prefix
 app.addHook('onRequest', (req, _reply, done) => {
-  if (req.url.startsWith('/api/')) {
+  if (req.url.startsWith('/api/')) { // support /api/*
     // @ts-ignore
     req.url = req.url.slice(4)
   }
@@ -121,31 +113,25 @@ function extractPhoneFromJid(jid?: string | null): string | null {
 
 function guessExt(mime: string | undefined): string {
   if (!mime) return 'bin'
-  if (mime.includes('jpeg')) return 'jpg'
-  if (mime.includes('jpg')) return 'jpg'
+  if (mime.includes('jpeg') || mime.includes('jpg')) return 'jpg'
   if (mime.includes('png')) return 'png'
   if (mime.includes('webp')) return 'webp'
   if (mime.includes('gif')) return 'gif'
   if (mime.includes('mp4')) return 'mp4'
   if (mime.includes('mpeg')) return 'mp3'
-  if (mime.includes('ogg')) return 'ogg'
-  if (mime.includes('opus')) return 'ogg'
+  if (mime.includes('ogg') || mime.includes('opus')) return 'ogg'
   if (mime.includes('pdf')) return 'pdf'
   return 'bin'
 }
 
-async function saveIncomingMedia(
-  msg: any
-): Promise<null | { filename: string; mimeType: string; url: string }> {
+async function saveIncomingMedia(msg: any): Promise<null | { filename: string; mimeType: string; url: string }> {
   let mediaType: 'image' | 'video' | 'audio' | 'document' | 'sticker' | null = null
   let mediaObj: any = null
-
   if (msg.message?.imageMessage) { mediaType = 'image'; mediaObj = msg.message.imageMessage }
   else if (msg.message?.videoMessage) { mediaType = 'video'; mediaObj = msg.message.videoMessage }
   else if (msg.message?.audioMessage) { mediaType = 'audio'; mediaObj = msg.message.audioMessage }
   else if (msg.message?.documentMessage) { mediaType = 'document'; mediaObj = msg.message.documentMessage }
   else if (msg.message?.stickerMessage) { mediaType = 'sticker'; mediaObj = msg.message.stickerMessage }
-
   if (!mediaType || !mediaObj) return null
 
   const stream = await downloadContentFromMessage(mediaObj, mediaType)
@@ -156,21 +142,13 @@ async function saveIncomingMedia(
   const mimeType = mediaObj.mimetype || 'application/octet-stream'
   const ext = guessExt(mimeType)
   const filename = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`
-  const absPath = path.join(MEDIA_DIR, filename)
-  fs.writeFileSync(absPath, buf)
-
+  fs.writeFileSync(path.join(MEDIA_DIR, filename), buf)
   const url = `${PUBLIC_BASE_URL}/media/${filename}`
   return { filename, mimeType, url }
 }
 
 function isRestartRequired(err: any) {
-  const code = Number(
-    err?.output?.statusCode ??
-    err?.status ??
-    err?.code ??
-    err?.statusCode ??
-    0
-  )
+  const code = Number(err?.output?.statusCode ?? err?.status ?? err?.code ?? err?.statusCode ?? 0)
   return code === 515 || code === DisconnectReason.restartRequired
 }
 
@@ -184,35 +162,47 @@ function hmacSha256Hex(secret: string, body: string) {
 }
 
 // -------------------------
-// sendWebhookEvent
+// WEBHOOK (compat snake + camel)
 // -------------------------
-async function sendWebhookEvent(
-  s: SessionState,
-  event: string,
-  payload: Record<string, any>
-) {
+async function sendWebhookEvent(s: SessionState, event: string, payload: Record<string, any>) {
   if (!s.webhookUrl) {
     app.log.warn({ msg: 'no webhookUrl for session, drop event', sessionId: s.id, event })
     return
   }
 
-  // 1er event = session.created :
-  // - signé avec WEBHOOK_SECRET_FALLBACK
-  // - on envoie aussi le secret unique de la session (s.webhookSecret)
   const isBootstrap = event === 'session.created'
-
   const secretToUse = isBootstrap
     ? (WEBHOOK_SECRET_FALLBACK || s.webhookSecret || '')
     : (s.webhookSecret || WEBHOOK_SECRET_FALLBACK || '')
 
-  const body = {
+  // compat : on envoie les 2 formes (snake/camel) + on “aplanit” certains champs utiles
+  const baseBody = {
+    // identifiants de session
     sessionId: s.id,
+    session_id: s.id,
+
+    // type d'event
     event,
-    ...(isBootstrap ? { sessionSecret: s.webhookSecret } : {}),
+    event_type: event,
+
+    // secret de session envoyé UNIQUEMENT au bootstrap (les handlers côté Supabase stockent ceci)
+    ...(isBootstrap ? { sessionSecret: s.webhookSecret, session_secret: s.webhookSecret } : {}),
+
+    // miroir camel + snake pour champs standards que l’Edge Function pourrait attendre
+    // (payload.data peut déjà contenir des clés — on laisse telle quelle)
     ...payload
   }
 
-  const json = JSON.stringify(body)
+  // petit sucre: si on nous a donné un phoneNumber/jid dans payload.data, on le reflète aussi au top-level en snake_case
+  const data = (payload as any)?.data || {}
+  if (data) {
+    if (data.phoneNumber && !('phone_number' in baseBody)) (baseBody as any).phone_number = data.phoneNumber
+    if (data.meId && !('me_id' in baseBody)) (baseBody as any).me_id = data.meId
+    if (data.jid && !('jid' in baseBody)) (baseBody as any).jid = data.jid
+    if (data.qr && !('qr_code' in baseBody)) (baseBody as any).qr_code = data.qr
+  }
+
+  const json = JSON.stringify(baseBody)
   const sig = hmacSha256Hex(secretToUse, json)
 
   try {
@@ -221,18 +211,19 @@ async function sendWebhookEvent(
       headers: {
         'Content-Type': 'application/json',
         'x-wa-signature': sig,
-        'x-wa-sig-version': isBootstrap ? 'bootstrap-v1' : 'session-v1'
+        'x-wa-sig-version': isBootstrap ? 'bootstrap-v1' : 'session-v1',
+        'x-wa-session': s.id
       },
       body: json
     })
-    app.log.info({ webhookPush: { sessionId: s.id, event, status: res.status } })
+    app.log.info({ webhookPush: { url: s.webhookUrl, sessionId: s.id, event, status: res.status } })
   } catch (e) {
     app.log.error({ msg: 'webhook push failed', sessionId: s.id, event, err: String(e) })
   }
 }
 
 // -------------------------
-// Envoi avec anti-ban
+// ENVOI (anti-ban)
 // -------------------------
 async function enqueueSend(s: SessionState, task: () => Promise<void>) {
   s.queue.push(task)
@@ -248,15 +239,10 @@ async function enqueueSend(s: SessionState, task: () => Promise<void>) {
         await new Promise(r => setTimeout(r, 1000))
         continue
       }
-
       const jitter = Math.floor(Math.random() * (SEND_JITTER_MS + 1))
       await new Promise(r => setTimeout(r, SEND_MIN_INTERVAL_MS + jitter))
-
       const fn = s.queue.shift()!
-      try {
-        await fn()
-        s.sentInCurrentMinute++
-      } catch (e) {
+      try { await fn(); s.sentInCurrentMinute++ } catch (e) {
         app.log.error({ msg: 'send task failed', err: String(e) })
       }
     }
@@ -265,16 +251,14 @@ async function enqueueSend(s: SessionState, task: () => Promise<void>) {
 }
 
 // -------------------------
-// Baileys handlers
+// HANDLERS BAILEYS
 // -------------------------
-function ensureChat(id: string): ChatLite {
-  return { id, name: null, subject: null, conversationTimestamp: null }
-}
+function ensureChat(id: string): ChatLite { return { id, name: null, subject: null, conversationTimestamp: null } }
 
 function wireChatContactStores(s: SessionState, sock: ReturnType<typeof makeWASocket>) {
   const setChats = (arr: any[]) => {
     for (const c of arr || []) {
-      const base: ChatLite = s.chats.get(c.id) ?? ensureChat(c.id)
+      const base = s.chats.get(c.id) ?? ensureChat(c.id)
       s.chats.set(c.id, {
         id: c.id,
         name: c.name ?? base.name ?? null,
@@ -285,58 +269,32 @@ function wireChatContactStores(s: SessionState, sock: ReturnType<typeof makeWASo
       })
     }
   }
-
-  ;(sock.ev as any).on('chats.set', (data: any) => setChats(data?.chats || []))
+  ;(sock.ev as any).on('chats.set', (d: any) => setChats(d?.chats || []))
   ;(sock.ev as any).on('chats.upsert', (arr: any[]) => setChats(arr))
   ;(sock.ev as any).on('chats.update', (updates: any[]) => {
     for (const u of updates || []) {
-      const base: ChatLite = s.chats.get(u.id) ?? ensureChat(u.id)
+      const base = s.chats.get(u.id) ?? ensureChat(u.id)
       s.chats.set(u.id, {
         ...base,
         ...(u.name !== undefined ? { name: u.name } : {}),
         ...(u.subject !== undefined ? { subject: u.subject } : {}),
-        ...(u.conversationTimestamp !== undefined
-          ? { conversationTimestamp: Number(u.conversationTimestamp || 0) }
-          : {})
+        ...(u.conversationTimestamp !== undefined ? { conversationTimestamp: Number(u.conversationTimestamp || 0) } : {})
       })
     }
   })
-
   ;(sock.ev as any).on('contacts.upsert', (arr: any[]) => {
     for (const c of arr || []) {
       const jid = c.id
       s.contacts.set(jid, { notify: c.notify, name: c.name })
       const chat = s.chats.get(jid)
-      if (chat && !chat.name && (c.notify || c.name)) {
-        s.chats.set(jid, { ...chat, name: c.notify || c.name })
-      }
+      if (chat && !chat.name && (c.notify || c.name)) s.chats.set(jid, { ...chat, name: c.notify || c.name })
     }
   })
-
   ;(sock.ev as any).on('messaging-history.set', ({ chats, contacts, messages, syncType }: any) => {
     if (Array.isArray(chats)) setChats(chats)
-    if (Array.isArray(contacts)) {
-      for (const c of contacts) {
-        const jid = c.id
-        s.contacts.set(jid, { notify: c.notify, name: c.name })
-      }
-    }
-    if (Array.isArray(messages)) {
-      for (const m of messages) {
-        const k = mkMsgKey(m.key)
-        if (k) {
-          s.messageStore.set(k, m.message)
-        }
-      }
-    }
-    app.log.info({
-      msg: 'history.sync',
-      id: s.id,
-      syncType,
-      chats: chats?.length,
-      contacts: contacts?.length,
-      messages: messages?.length
-    })
+    if (Array.isArray(contacts)) for (const c of contacts) s.contacts.set(c.id, { notify: c.notify, name: c.name })
+    if (Array.isArray(messages)) for (const m of messages) { const k = mkMsgKey(m.key); if (k) s.messageStore.set(k, m.message) }
+    app.log.info({ msg: 'history.sync', id: s.id, syncType, chats: chats?.length, contacts: contacts?.length, messages: messages?.length })
   })
 }
 
@@ -344,24 +302,18 @@ async function onMessagesUpsert(s: SessionState, up: any) {
   const type = up?.type
   const arr = Array.isArray(up?.messages) ? up.messages : []
   if (!arr.length) return
-
   for (const msg of arr) {
     const remoteJid = msg.key?.remoteJid || ''
     const fromMe = msg.key?.fromMe === true
     const chatNumber = extractPhoneFromJid(remoteJid)
-
-    const storeKey = mkMsgKey(msg.key)
-    if (storeKey) {
-      s.messageStore.set(storeKey, msg.message)
-    }
+    const storeKey = mkMsgKey(msg.key); if (storeKey) s.messageStore.set(storeKey, msg.message)
 
     const text =
       msg.message?.conversation ||
       msg.message?.extendedTextMessage?.text ||
       msg.message?.imageMessage?.caption ||
       msg.message?.videoMessage?.caption ||
-      msg.message?.documentMessage?.caption ||
-      ''
+      msg.message?.documentMessage?.caption || ''
 
     const mediaInfo = await saveIncomingMedia(msg).catch(() => null)
 
@@ -369,11 +321,11 @@ async function onMessagesUpsert(s: SessionState, up: any) {
     const tsSec = Number(msg.messageTimestamp || 0)
     s.chats.set(remoteJid, { ...base, conversationTimestamp: tsSec })
 
-    const eventName = fromMe ? 'message.out' : 'message.in'
-    await sendWebhookEvent(s, eventName, {
+    await sendWebhookEvent(s, fromMe ? 'message.out' : 'message.in', {
       data: {
         from: chatNumber || remoteJid,
         fromJid: remoteJid,
+        jid: remoteJid,
         fromMe,
         text,
         media: mediaInfo || null,
@@ -387,40 +339,13 @@ async function onMessagesUpsert(s: SessionState, up: any) {
 
 function attachSocketHandlers(s: SessionState, sock: ReturnType<typeof makeWASocket>) {
   if (s.saveCreds) sock.ev.on('creds.update', s.saveCreds)
-
   sock.ev.on('connection.update', async (u) => onConnectionUpdate(s, u))
   sock.ev.on('messages.upsert', async (m) => onMessagesUpsert(s, m))
-  sock.ev.on('messages.update', async (updates: any[]) =>
-    sendWebhookEvent(s, 'messages.update', { data: updates, ts: Date.now() }))
-  sock.ev.on('messages.delete', async (d) =>
-    sendWebhookEvent(s, 'messages.delete', { data: d, ts: Date.now() }))
-  sock.ev.on('messages.reaction', async (r) =>
-    sendWebhookEvent(s, 'messages.reaction', { data: r, ts: Date.now() }))
-  sock.ev.on('message-receipt.update', async (r) =>
-    sendWebhookEvent(s, 'message-receipt.update', { data: r, ts: Date.now() }))
-
-  sock.ev.on('chats.upsert', async (c) =>
-    sendWebhookEvent(s, 'chats.upsert', { data: c, ts: Date.now() }))
-  sock.ev.on('chats.update', async (c) =>
-    sendWebhookEvent(s, 'chats.update', { data: c, ts: Date.now() }))
-  sock.ev.on('chats.delete', async (c) =>
-    sendWebhookEvent(s, 'chats.delete', { data: c, ts: Date.now() }))
-
-  sock.ev.on('groups.upsert', async (g) =>
-    sendWebhookEvent(s, 'groups.upsert', { data: g, ts: Date.now() }))
-  sock.ev.on('groups.update', async (g) =>
-    sendWebhookEvent(s, 'groups.update', { data: g, ts: Date.now() }))
-  sock.ev.on('group-participants.update', async (g) =>
-    sendWebhookEvent(s, 'group-participants.update', { data: g, ts: Date.now() }))
-
-  sock.ev.on('contacts.update', async (c) =>
-    sendWebhookEvent(s, 'contacts.update', { data: c, ts: Date.now() }))
-
   wireChatContactStores(s, sock)
 }
 
 // -------------------------
-// Seed 10 convos pour éviter l'écran vide
+// HISTORY SEED (10 convos)
 // -------------------------
 async function pushInitialHistorySeed(s: SessionState) {
   const chats = Array.from(s.chats.values())
@@ -440,13 +365,13 @@ async function pushInitialHistorySeed(s: SessionState) {
           m.message?.extendedTextMessage?.text ||
           m.message?.imageMessage?.caption ||
           m.message?.videoMessage?.caption ||
-          m.message?.documentMessage?.caption ||
-          null
+          m.message?.documentMessage?.caption || null
         lastTsMs = Number(m.messageTimestamp || 0) * 1000
       }
     } catch {}
     items.push({
       chatJid: c.id,
+      jid: c.id,
       chatNumber: extractPhoneFromJid(c.id),
       chatName: c.name || c.subject || null,
       lastText,
@@ -454,31 +379,25 @@ async function pushInitialHistorySeed(s: SessionState) {
     })
   }
 
-  await sendWebhookEvent(s, 'bootstrap.history', {
-    data: { items },
-    ts: Date.now()
-  })
+  await sendWebhookEvent(s, 'bootstrap.history', { data: { items }, ts: Date.now() })
 }
 
 // -------------------------
-// Connection state
+// CONNECTION UPDATE
 // -------------------------
 async function onConnectionUpdate(s: SessionState, u: any) {
   app.log.info({ wa_update: { conn: u.connection, hasQR: !!u.qr, disc: !!u.lastDisconnect } })
 
-  // QR dispo = on le stocke pour l'UI + on signale session.created
   if (u.qr) {
     s.qr_text = u.qr
     try { s.qr = await QRCode.toDataURL(u.qr) } catch { s.qr = null }
 
-    // on notifie Supabase que la session vient d'être créée (ça va stocker webhook_secret)
     await sendWebhookEvent(s, 'session.created', {
-      data: { sessionId: s.id, qr: s.qr || null, qr_text: s.qr_text || null },
+      data: { sessionId: s.id, qr: s.qr || null, qr_code: s.qr || null, qr_text: s.qr_text || null },
       ts: Date.now()
     })
   }
 
-  // connexion ouverte = téléphone appairé
   if (u.connection === 'open') {
     s.connected = true
     s.qr = null
@@ -490,47 +409,40 @@ async function onConnectionUpdate(s: SessionState, u: any) {
       s.meNumber = num || null
       s.phoneNumber = s.meNumber || null
 
-      // maintenant qu'on connaît le numéro, on enrichit l'URL webhook :
+      // enrichit l’URL webhook avec le numéro (snake_case dans query)
       if (SUPABASE_WEBHOOK_URL) {
-        s.webhookUrl =
-          `${SUPABASE_WEBHOOK_URL}?session_id=${encodeURIComponent(s.id)}&phone=${encodeURIComponent(s.phoneNumber || '')}`
+        s.webhookUrl = `${SUPABASE_WEBHOOK_URL}?session_id=${encodeURIComponent(s.id)}&phone=${encodeURIComponent(s.phoneNumber || '')}`
       }
     }
 
-    // prévenir Supabase que la session est active + numéro connu
+    // on envoie camel + snake au top-level dans data
     await sendWebhookEvent(s, 'session.connected', {
-      data: { meId: s.meId || null, phoneNumber: s.meNumber || null },
+      data: {
+        meId: s.meId || null,
+        me_id: s.meId || null,
+        jid: s.meId || null,
+        phoneNumber: s.meNumber || null,
+        phone_number: s.meNumber || null,
+        device_name: 'Zuria/Render'
+      },
       ts: Date.now()
     })
 
-    // envoyer l'historique initial
-    setTimeout(() => {
-      pushInitialHistorySeed(s).catch(() => {})
-    }, 3000)
+    setTimeout(() => { pushInitialHistorySeed(s).catch(() => {}) }, 3000)
     return
   }
 
-  // connexion fermée
   if (u.connection === 'close') {
     const err = (u.lastDisconnect as any)?.error
-
     if (isRestartRequired(err)) {
       app.log.warn({ msg: 'restart required (515) — restarting socket', id: s.id })
       await restartSession(s.id)
       return
     }
-
-    const code = Number(
-      err?.output?.statusCode ?? err?.status ?? err?.code ?? err?.statusCode ?? 0
-    )
+    const code = Number(err?.output?.statusCode ?? err?.status ?? err?.code ?? err?.statusCode ?? 0)
     if (code === DisconnectReason.loggedOut) {
       s.connected = false
-      app.log.warn({ msg: 'logged out — rescan required', id: s.id })
-
-      await sendWebhookEvent(s, 'session.disconnected', {
-        data: { reason: 'loggedOut' },
-        ts: Date.now()
-      })
+      await sendWebhookEvent(s, 'session.disconnected', { data: { reason: 'loggedOut' }, ts: Date.now() })
       return
     }
     s.connected = false
@@ -538,12 +450,10 @@ async function onConnectionUpdate(s: SessionState, u: any) {
 }
 
 // -------------------------
-// Socket lifecycle
+// SOCKET LIFECYCLE
 // -------------------------
 async function buildSocket(s: SessionState) {
   const waLogger = pino({ level: process.env.WA_LOG_LEVEL || 'info', name: `wa:${s.id}` })
-
-  // on récupère la dernière version supportée par WhatsApp
   const { version } = await fetchLatestBaileysVersion()
 
   const sock = makeWASocket({
@@ -554,99 +464,51 @@ async function buildSocket(s: SessionState) {
     syncFullHistory: FULL_HISTORY,
     markOnlineOnConnect: MARK_ONLINE,
     printQRInTerminal: false,
-
     getMessage: async (key: WAMessageKey) => {
-      const k = mkMsgKey(key)
-      return k ? s.messageStore.get(k) : undefined
+      const k = mkMsgKey(key); return k ? s.messageStore.get(k) : undefined
     },
-
     cachedGroupMetadata: async (jid: string) => {
       let md: any = s.groupCache.get(jid) as any
-      if (!md && s.sock) {
-        try {
-          md = await s.sock.groupMetadata(jid)
-          if (md) s.groupCache.set(jid, md, 3600)
-        } catch {}
-      }
+      if (!md && s.sock) { try { md = await s.sock.groupMetadata(jid); if (md) s.groupCache.set(jid, md, 3600) } catch {} }
       return md as any
     },
-
     connectTimeoutMs: 60_000,
     defaultQueryTimeoutMs: 60_000
   })
-
   return sock
 }
 
 async function restartSession(id: string) {
-  const s = sessions.get(id)
-  if (!s) return
-
-  app.log.warn({ msg: 'restart WA session', id })
-
+  const s = sessions.get(id); if (!s) return
   try { (s.sock as any)?.ev?.removeAllListeners?.() } catch {}
   try { (s.sock as any)?.ws?.close?.() } catch {}
-  s.sock = undefined
-  s.connected = false
-  s.qr = null
-  s.qr_text = null
-
+  s.sock = undefined; s.connected = false; s.qr = null; s.qr_text = null
   const { state, saveCreds } = await useMultiFileAuthState(path.join(AUTH_DIR, id))
-  s.saveCreds = saveCreds
-  ;(s as any).authState = state
-
-  const sock = await buildSocket(s)
-  s.sock = sock
-  attachSocketHandlers(s, sock)
+  s.saveCreds = saveCreds; (s as any).authState = state
+  const sock = await buildSocket(s); s.sock = sock; attachSocketHandlers(s, sock)
 }
 
 async function startSession(id: string) {
   fs.mkdirSync(path.join(AUTH_DIR, id), { recursive: true })
-
   const { state, saveCreds } = await useMultiFileAuthState(path.join(AUTH_DIR, id))
-
   const s: SessionState = {
-    id,
-    qr: null,
-    qr_text: null,
-    connected: false,
-    saveCreds,
-    phoneNumber: null,
-    meId: null,
-    meNumber: null,
-    chats: new Map(),
-    contacts: new Map(),
-    messageStore: new Map(),
+    id, qr: null, qr_text: null, connected: false, saveCreds,
+    phoneNumber: null, meId: null, meNumber: null,
+    chats: new Map(), contacts: new Map(), messageStore: new Map(),
     groupCache: new NodeCache({ stdTTL: 3600 }),
-    queue: [],
-    sending: false,
-    lastMinuteWindowStart: Date.now(),
-    sentInCurrentMinute: 0
+    queue: [], sending: false, lastMinuteWindowStart: Date.now(), sentInCurrentMinute: 0
   }
   ;(s as any).authState = state
-
-  // secret unique par session (sert à signer tous les webhooks après bootstrap)
-  s.webhookSecret = crypto.randomBytes(32).toString('hex')
-
-  // première URL webhook (avant qu'on connaisse le numéro tel)
-  if (SUPABASE_WEBHOOK_URL) {
-    s.webhookUrl = `${SUPABASE_WEBHOOK_URL}?session_id=${encodeURIComponent(s.id)}`
-  }
-
-  const sock = await buildSocket(s)
-  s.sock = sock
-
-  sessions.set(id, s)
-  attachSocketHandlers(s, sock)
-
+  s.webhookSecret = crypto.randomBytes(32).toString('hex') // secret par session
+  if (SUPABASE_WEBHOOK_URL) s.webhookUrl = `${SUPABASE_WEBHOOK_URL}?session_id=${encodeURIComponent(s.id)}`
+  const sock = await buildSocket(s); s.sock = sock
+  sessions.set(id, s); attachSocketHandlers(s, sock)
   return s
 }
 
 // -------------------------
-// ROUTES HTTP
+// ROUTES HTTP (UI debug)
 // -------------------------
-
-// page debug
 app.get('/', async (_req, reply) => {
   const html = `
   <html>
@@ -661,7 +523,7 @@ app.get('/', async (_req, reply) => {
         const j = await r.json()
         const out = document.getElementById('out')
         out.innerHTML = '<p><b>Session:</b> '+j.session_id+'</p>'
-                       + '<img id="qr" style="width:300px;border:1px solid #ccc"/>' 
+                       + '<img id="qr" style="width:300px;border:1px solid #ccc"/>'
                        + '<div id="stat"></div>'
         const img = document.getElementById('qr')
         const stat = document.getElementById('stat')
@@ -670,12 +532,9 @@ app.get('/', async (_req, reply) => {
           const s = await r2.json()
           if(s.qr){ img.src = s.qr }
           else if (s.qr_text) {
-            img.src = 'https://api.qrserver.com/v1/create-qr-code/?size=300x300&data='
-                      + encodeURIComponent(s.qr_text)
+            img.src = 'https://api.qrserver.com/v1/create-qr-code/?size=300x300&data='+encodeURIComponent(s.qr_text)
           }
-          stat.textContent = s.connected
-            ? '✅ Connecté ('+(s.phoneNumber||'???')+')'
-            : '⏳ En attente...'
+          stat.textContent = s.connected ? '✅ Connecté ('+(s.phoneNumber||'???')+')' : '⏳ En attente...'
           if(s.connected){ clearInterval(interval); img.remove() }
         }, 1500)
       }
@@ -685,91 +544,21 @@ app.get('/', async (_req, reply) => {
   reply.type('text/html').send(html)
 })
 
-// test UI envoi
-app.get('/send', async (_req, reply) => {
-  const html = `
-  <html>
-    <head><meta charset="utf-8"><title>Envoyer un message</title></head>
-    <body style="font-family: system-ui; max-width: 700px; margin: 40px auto;">
-      <h2>Envoyer un message WhatsApp</h2>
-      <label>ID de session<br/><input id="sid" style="width:100%"/></label>
-      <div style="margin:8px 0">
-        <button id="check">Vérifier statut</button>
-        <button id="restart">Relancer</button>
-        <button id="logout">Logout complet</button>
-      </div>
-      <label>Numéro (ex: 41760000000)<br/><input id="to" style="width:100%" placeholder="chiffres uniquement"/></label>
-      <br/><br/>
-      <label>Message<br/><textarea id="text" style="width:100%; height:120px">Hello depuis Zuria 🚀</textarea></label>
-      <br/><br/>
-      <button id="btn">Envoyer</button>
-      <pre id="out" style="background:#111;color:#0f0;padding:12px;margin-top:16px;white-space:pre-wrap;"></pre>
-      <script>
-        const out = document.getElementById('out')
-        document.getElementById('check').onclick = async () => {
-          const sid = (document.getElementById('sid').value || '').trim()
-          const r = await fetch('/sessions/' + sid)
-          out.textContent = JSON.stringify(await r.json(), null, 2)
-        }
-        document.getElementById('restart').onclick = async () => {
-          const sid = (document.getElementById('sid').value || '').trim()
-          const r = await fetch('/sessions/' + sid + '/restart', { method: 'POST' })
-          out.textContent = JSON.stringify(await r.json(), null, 2)
-        }
-        document.getElementById('logout').onclick = async () => {
-          const sid = (document.getElementById('sid').value || '').trim()
-          const r = await fetch('/sessions/' + sid + '/logout', { method: 'POST' })
-          out.textContent = JSON.stringify(await r.json(), null, 2)
-        }
-        document.getElementById('btn').onclick = async () => {
-          const sessionId = (document.getElementById('sid').value || '').trim()
-          const to = (document.getElementById('to').value || '').trim()
-          const text = document.getElementById('text').value
-          out.textContent = 'Envoi en cours...'
-          try {
-            const r = await fetch('/messages', {
-              method:'POST',
-              headers:{ 'Content-Type':'application/json' },
-              body: JSON.stringify({ sessionId, to, text })
-            })
-            out.textContent = JSON.stringify(await r.json(), null, 2)
-          } catch (e) {
-            out.textContent = 'Erreur: ' + e
-          }
-        }
-      </script>
-    </body>
-  </html>`
-  reply.type('text/html').send(html)
-})
-
-// créer une session
+// create session
 app.post('/sessions', async (_req, reply) => {
   const id = uuid()
-  app.log.info({ msg: 'create session', id })
   const s = await startSession(id)
-
-  // avant que le numéro soit connu
-  if (SUPABASE_WEBHOOK_URL) {
-    s.webhookUrl = `${SUPABASE_WEBHOOK_URL}?session_id=${encodeURIComponent(s.id)}`
-  }
-
-  // info bootstrap envoyée à Supabase
-  await sendWebhookEvent(s, 'session.created', {
-    data: { sessionId: s.id },
-    ts: Date.now()
-  })
-
-  await new Promise(res => setTimeout(res, 500))
+  if (SUPABASE_WEBHOOK_URL) s.webhookUrl = `${SUPABASE_WEBHOOK_URL}?session_id=${encodeURIComponent(s.id)}`
+  await sendWebhookEvent(s, 'session.created', { data: { sessionId: s.id }, ts: Date.now() })
+  await new Promise(res => setTimeout(res, 300))
   return reply.send({ session_id: s.id })
 })
 
-// status session
+// session status
 app.get('/sessions/:id', async (req, reply) => {
   const id = (req.params as any).id
   const s = sessions.get(id)
   if (!s) return reply.code(404).send({ error: 'unknown session' })
-
   return reply.send({
     session_id: id,
     connected: s.connected,
@@ -782,78 +571,36 @@ app.get('/sessions/:id', async (req, reply) => {
   })
 })
 
-// restart session
-app.post('/sessions/:id/restart', async (req, reply) => {
-  const id = (req.params as any).id
-  const s = sessions.get(id)
-  if (!s) return reply.code(404).send({ error: 'unknown session' })
-  await restartSession(id)
-  return reply.send({ ok: true })
-})
-
-// override webhook (manuel)
-app.post('/sessions/:id/webhook', async (req, reply) => {
-  const id = (req.params as any).id
-  const s = sessions.get(id)
-  if (!s) return reply.code(404).send({ error: 'unknown session' })
-
-  const { url, secret } = (req.body as any) || {}
-  if (!url) return reply.code(400).send({ error: 'missing url' })
-
-  s.webhookUrl = String(url)
-  if (secret) s.webhookSecret = String(secret)
-
-  return reply.send({ ok: true, session_id: id, webhookUrl: s.webhookUrl })
-})
-
-// envoyer un message whatsapp
+// send message
 app.post('/messages', async (req, reply) => {
   if (API_KEY) {
     const hdr = req.headers['x-api-key']
     if (!hdr || hdr !== API_KEY) return reply.code(401).send({ error: 'unauthorized' })
   }
-
   const { sessionId, to, text } = (req.body as any) || {}
   const s = sessions.get(sessionId)
   if (!s?.sock) return reply.code(400).send({ error: 'session not ready' })
-
   const jid = `${String(to).replace(/[^\d]/g, '')}@s.whatsapp.net`
-
   await new Promise<void>((res, rej) => {
     enqueueSend(s, async () => {
       const resMsg = await s.sock!.sendMessage(jid, { text: String(text || '') })
-
-      const k = mkMsgKey(resMsg?.key)
-      if (k) {
-        const safeMessage = (resMsg as any)?.message ?? undefined
-        s.messageStore.set(k, safeMessage)
-      }
-
-      await sendWebhookEvent(s, 'message.out', {
-        data: { to: jid, text: String(text || ''), key: resMsg?.key },
-        ts: Date.now()
-      })
+      const k = mkMsgKey(resMsg?.key); if (k) s.messageStore.set(k, (resMsg as any)?.message ?? undefined)
+      await sendWebhookEvent(s, 'message.out', { data: { to: jid, text: String(text || ''), key: resMsg?.key }, ts: Date.now() })
     }).then(res).catch(rej)
   })
-
   return reply.send({ ok: true })
 })
 
-// health
 app.get('/health', async (_req, reply) => reply.send({ ok: true }))
 
 // -------------------------
-// BOOTSTRAP SERVER
+// BOOTSTRAP
 // -------------------------
 async function bootstrap() {
   await app.register(cors, { origin: true })
   await app.register(fastifyStatic, { root: MEDIA_DIR, prefix: '/media/' })
-
   app.listen({ port: PORT, host: '0.0.0.0' })
     .then(() => app.log.info(`HTTP server listening on ${PORT}`))
-    .catch((err) => {
-      app.log.error(err)
-      process.exit(1)
-    })
+    .catch((err) => { app.log.error(err); process.exit(1) })
 }
 bootstrap()
