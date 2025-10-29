@@ -8,12 +8,17 @@ import fastifyStatic from '@fastify/static'
 import cors from '@fastify/cors'
 import QRCode from 'qrcode'
 import { v4 as uuid } from 'uuid'
+import crypto from 'crypto'
+import pino from 'pino'
+import NodeCache from 'node-cache'
 
 import makeWASocket, {
-  useMultiFileAuthState,
+  useMultiFileAuthState,              // ⚠️ MVP. Prévoir store DB/Redis en prod.
   DisconnectReason,
-  fetchLatestBaileysVersion,
-  downloadContentFromMessage
+  downloadContentFromMessage,
+  Browsers,
+  proto,
+  WAMessageKey
 } from '@whiskeysockets/baileys'
 
 import fs from 'fs'
@@ -25,20 +30,28 @@ import path from 'path'
 const PORT = parseInt(process.env.PORT || '3001', 10)
 const AUTH_DIR = process.env.AUTH_DIR || './.wa'
 const MEDIA_DIR = process.env.MEDIA_DIR || path.join(AUTH_DIR, 'media')
-const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || 'https://zuria-wa.onrender.com').replace(/\/$/, '')
-const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || ''
+const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || process.env.RENDER_EXTERNAL_URL || 'https://zuria-wa.onrender.com').replace(/\/$/, '')
+
+const WEBHOOK_SECRET_FALLBACK = process.env.WEBHOOK_SECRET || ''
+const SUPABASE_WEBHOOK_URL = process.env.SUPABASE_WEBHOOK_URL || ''   // Edge Function cible
 const API_KEY = process.env.API_KEY || ''
+
+const MARK_ONLINE = (process.env.WA_MARK_ONLINE || 'false').toLowerCase() === 'true'
+const FULL_HISTORY = (process.env.WA_FULL_HISTORY || 'true').toLowerCase() !== 'false'
+
+// Anti-ban pacing
+const SEND_MIN_INTERVAL_MS = Math.max(0, parseInt(process.env.SEND_MIN_INTERVAL_MS || '1500', 10))
+const SEND_MAX_PER_MINUTE = Math.max(1, parseInt(process.env.SEND_MAX_PER_MINUTE || '20', 10))
+const SEND_JITTER_MS = Math.max(0, parseInt(process.env.SEND_JITTER_MS || '400', 10))
 
 // -------------------------
 // TYPES & MEMORY
 // -------------------------
-
 type ChatLite = {
   id: string
   name?: string | null
   subject?: string | null
-  /** seconds since epoch (Baileys) */
-  conversationTimestamp?: number | null
+  conversationTimestamp?: number | null // seconds since epoch (Baileys)
 }
 
 type SessionState = {
@@ -57,7 +70,7 @@ type SessionState = {
   // creds persist
   saveCreds?: () => Promise<void>
 
-  // per-session webhook
+  // per-session webhook (unique)
   webhookUrl?: string
   webhookSecret?: string
 
@@ -69,6 +82,14 @@ type SessionState = {
   // minimal in-memory stores
   chats: Map<string, ChatLite>
   contacts: Map<string, { notify?: string; name?: string }>
+  messageStore: Map<string, proto.IMessage | undefined>
+  groupCache: NodeCache
+
+  // pacing / queue
+  queue: Array<() => Promise<void>>
+  sending: boolean
+  lastMinuteWindowStart: number
+  sentInCurrentMinute: number
 }
 
 const sessions = new Map<string, SessionState>()
@@ -78,7 +99,6 @@ const sessions = new Map<string, SessionState>()
 // -------------------------
 const app = Fastify({ logger: true })
 
-// permissive JSON parser (accept empty JSON body)
 app.addContentTypeParser('application/json', { parseAs: 'string' }, (req, body, done) => {
   try {
     if (!body || (typeof body === 'string' && body.trim() === '')) {
@@ -92,19 +112,14 @@ app.addContentTypeParser('application/json', { parseAs: 'string' }, (req, body, 
   }
 })
 
-// prefix fallback: allow /api/* to hit same handlers
 app.addHook('onRequest', (req, _reply, done) => {
   if (req.url.startsWith('/api/')) {
-    // Fastify autorise techniquement de réécrire req.url,
-    // mais le type TS marque req.url comme readonly.
-    // On force l'override pour supporter /api/... sur Render.
     // @ts-ignore
     req.url = req.url.slice(4)
   }
   done()
 })
 
-// ensure media dir exists
 fs.mkdirSync(MEDIA_DIR, { recursive: true })
 
 // -------------------------
@@ -137,22 +152,11 @@ async function saveIncomingMedia(
   let mediaType: 'image' | 'video' | 'audio' | 'document' | 'sticker' | null = null
   let mediaObj: any = null
 
-  if (msg.message?.imageMessage) {
-    mediaType = 'image'
-    mediaObj = msg.message.imageMessage
-  } else if (msg.message?.videoMessage) {
-    mediaType = 'video'
-    mediaObj = msg.message.videoMessage
-  } else if (msg.message?.audioMessage) {
-    mediaType = 'audio'
-    mediaObj = msg.message.audioMessage
-  } else if (msg.message?.documentMessage) {
-    mediaType = 'document'
-    mediaObj = msg.message.documentMessage
-  } else if (msg.message?.stickerMessage) {
-    mediaType = 'sticker'
-    mediaObj = msg.message.stickerMessage
-  }
+  if (msg.message?.imageMessage) { mediaType = 'image'; mediaObj = msg.message.imageMessage }
+  else if (msg.message?.videoMessage) { mediaType = 'video'; mediaObj = msg.message.videoMessage }
+  else if (msg.message?.audioMessage) { mediaType = 'audio'; mediaObj = msg.message.audioMessage }
+  else if (msg.message?.documentMessage) { mediaType = 'document'; mediaObj = msg.message.documentMessage }
+  else if (msg.message?.stickerMessage) { mediaType = 'sticker'; mediaObj = msg.message.stickerMessage }
 
   if (!mediaType || !mediaObj) return null
 
@@ -174,12 +178,22 @@ async function saveIncomingMedia(
 function isRestartRequired(err: any) {
   const code = Number(
     err?.output?.statusCode ??
-      err?.status ??
-      err?.code ??
-      err?.statusCode ??
-      0
+    err?.status ??
+    err?.code ??
+    err?.statusCode ??
+    0
   )
   return code === 515 || code === DisconnectReason.restartRequired
+}
+
+function mkMsgKey(key?: WAMessageKey): string | null {
+  if (!key?.id || !key.remoteJid) return null
+  return `${key.id}|${key.remoteJid}`
+}
+
+// HMAC SHA-256 (secret + body)
+function hmacSha256Hex(secret: string, body: string) {
+  return crypto.createHmac('sha256', secret).update(body).digest('hex')
 }
 
 async function sendWebhookEvent(
@@ -191,17 +205,19 @@ async function sendWebhookEvent(
     app.log.warn({ msg: 'no webhookUrl for session, drop event', sessionId: s.id, event })
     return
   }
-  const signature = s.webhookSecret || WEBHOOK_SECRET || ''
+  const secret = s.webhookSecret || WEBHOOK_SECRET_FALLBACK || ''
   const body = { sessionId: s.id, event, ...payload }
+  const json = JSON.stringify(body)
+  const sig = hmacSha256Hex(secret, json)
 
   try {
     const res = await fetch(s.webhookUrl, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'x-wa-signature': signature
+        'x-wa-signature': sig
       },
-      body: JSON.stringify(body)
+      body: json
     })
     app.log.info({ webhookPush: { sessionId: s.id, event, status: res.status } })
   } catch (e) {
@@ -209,15 +225,46 @@ async function sendWebhookEvent(
   }
 }
 
+// envoi avec pacing/queue par session
+async function enqueueSend(s: SessionState, task: () => Promise<void>) {
+  s.queue.push(task)
+  if (!s.sending) {
+    s.sending = true
+    while (s.queue.length) {
+      // rate limit par minute
+      const now = Date.now()
+      if (now - s.lastMinuteWindowStart >= 60_000) {
+        s.lastMinuteWindowStart = now
+        s.sentInCurrentMinute = 0
+      }
+      if (s.sentInCurrentMinute >= SEND_MAX_PER_MINUTE) {
+        await new Promise(r => setTimeout(r, 1000)) // attendre 1s et re-check
+        continue
+      }
+
+      // délai mini + jitter
+      const jitter = Math.floor(Math.random() * (SEND_JITTER_MS + 1))
+      await new Promise(r => setTimeout(r, SEND_MIN_INTERVAL_MS + jitter))
+
+      const fn = s.queue.shift()!
+      try {
+        await fn()
+        s.sentInCurrentMinute++
+      } catch (e) {
+        app.log.error({ msg: 'send task failed', err: String(e) })
+      }
+    }
+    s.sending = false
+  }
+}
+
 // -------------------------
 // BAILEYS HANDLERS
 // -------------------------
-
 function ensureChat(id: string): ChatLite {
   return { id, name: null, subject: null, conversationTimestamp: null }
 }
 
-// Keep minimal chat/contact stores up-to-date (bypass typings with `as any`)
 function wireChatContactStores(s: SessionState, sock: ReturnType<typeof makeWASocket>) {
   const setChats = (arr: any[]) => {
     for (const c of arr || []) {
@@ -259,6 +306,141 @@ function wireChatContactStores(s: SessionState, sock: ReturnType<typeof makeWASo
       }
     }
   })
+
+  ;(sock.ev as any).on('messaging-history.set', ({ chats, contacts, messages, syncType }: any) => {
+    if (Array.isArray(chats)) setChats(chats)
+    if (Array.isArray(contacts)) {
+      for (const c of contacts) {
+        const jid = c.id
+        s.contacts.set(jid, { notify: c.notify, name: c.name })
+      }
+    }
+    if (Array.isArray(messages)) {
+      for (const m of messages) {
+        const k = mkMsgKey(m.key)
+        if (k) s.messageStore.set(k, m.message)
+      }
+    }
+    app.log.info({ msg: 'history.sync', id: s.id, syncType, chats: chats?.length, contacts: contacts?.length, messages: messages?.length })
+  })
+}
+
+async function onMessagesUpsert(s: SessionState, up: any) {
+  const type = up?.type
+  const arr = Array.isArray(up?.messages) ? up.messages : []
+  if (!arr.length) return
+
+  for (const msg of arr) {
+    const remoteJid = msg.key?.remoteJid || ''
+    const fromMe = msg.key?.fromMe === true
+    const chatNumber = extractPhoneFromJid(remoteJid)
+
+    const storeKey = mkMsgKey(msg.key)
+    if (storeKey) s.messageStore.set(storeKey, msg.message)
+
+    const text =
+      msg.message?.conversation ||
+      msg.message?.extendedTextMessage?.text ||
+      msg.message?.imageMessage?.caption ||
+      msg.message?.videoMessage?.caption ||
+      msg.message?.documentMessage?.caption ||
+      ''
+
+    const mediaInfo = await saveIncomingMedia(msg).catch(() => null) // may be null
+
+    // update chat timestamp
+    const base = s.chats.get(remoteJid) ?? ensureChat(remoteJid)
+    const tsSec = Number(msg.messageTimestamp || 0)
+    s.chats.set(remoteJid, { ...base, conversationTimestamp: tsSec })
+
+    const eventName = fromMe ? 'message.out' : 'message.in'
+    await sendWebhookEvent(s, eventName, {
+      data: {
+        from: chatNumber || remoteJid,
+        fromJid: remoteJid,
+        fromMe,
+        text,
+        media: mediaInfo || null,
+        timestampMs: tsSec * 1000,
+        upsertType: type
+      },
+      ts: Date.now()
+    })
+  }
+}
+
+function attachSocketHandlers(s: SessionState, sock: ReturnType<typeof makeWASocket>) {
+  if (s.saveCreds) sock.ev.on('creds.update', s.saveCreds)
+
+  sock.ev.on('connection.update', async (u) => onConnectionUpdate(s, u))
+  sock.ev.on('messages.upsert', async (m) => onMessagesUpsert(s, m))
+  sock.ev.on('messages.update', async (updates: any[]) =>
+    sendWebhookEvent(s, 'messages.update', { data: updates, ts: Date.now() }))
+  sock.ev.on('messages.delete', async (d) =>
+    sendWebhookEvent(s, 'messages.delete', { data: d, ts: Date.now() }))
+  sock.ev.on('messages.reaction', async (r) =>
+    sendWebhookEvent(s, 'messages.reaction', { data: r, ts: Date.now() }))
+  sock.ev.on('message-receipt.update', async (r) =>
+    sendWebhookEvent(s, 'message-receipt.update', { data: r, ts: Date.now() }))
+
+  sock.ev.on('chats.upsert', async (c) =>
+    sendWebhookEvent(s, 'chats.upsert', { data: c, ts: Date.now() }))
+  sock.ev.on('chats.update', async (c) =>
+    sendWebhookEvent(s, 'chats.update', { data: c, ts: Date.now() }))
+  sock.ev.on('chats.delete', async (c) =>
+    sendWebhookEvent(s, 'chats.delete', { data: c, ts: Date.now() }))
+
+  sock.ev.on('groups.upsert', async (g) =>
+    sendWebhookEvent(s, 'groups.upsert', { data: g, ts: Date.now() }))
+  sock.ev.on('groups.update', async (g) =>
+    sendWebhookEvent(s, 'groups.update', { data: g, ts: Date.now() }))
+  sock.ev.on('group-participants.update', async (g) =>
+    sendWebhookEvent(s, 'group-participants.update', { data: g, ts: Date.now() }))
+
+  sock.ev.on('contacts.update', async (c) =>
+    sendWebhookEvent(s, 'contacts.update', { data: c, ts: Date.now() }))
+
+  wireChatContactStores(s, sock)
+}
+
+async function pushInitialHistorySeed(s: SessionState) {
+  // prendre les 10 chats les plus récents
+  const chats = Array.from(s.chats.values())
+    .sort((a, b) => (Number(b.conversationTimestamp || 0) - Number(a.conversationTimestamp || 0)))
+    .slice(0, 10)
+
+  const items: any[] = []
+  for (const c of chats) {
+    let lastText: string | null = null
+    let lastTsMs: number | null = null
+    try {
+      const msgs = await (s.sock as any).loadMessages(c.id, 1)
+      const m = msgs?.[0]
+      if (m) {
+        lastText =
+          m.message?.conversation ||
+          m.message?.extendedTextMessage?.text ||
+          m.message?.imageMessage?.caption ||
+          m.message?.videoMessage?.caption ||
+          m.message?.documentMessage?.caption ||
+          null
+        lastTsMs = Number(m.messageTimestamp || 0) * 1000
+      }
+    } catch {}
+
+    items.push({
+      chatJid: c.id,
+      chatNumber: extractPhoneFromJid(c.id),
+      chatName: c.name || c.subject || null,
+      lastText,
+      lastTsMs
+    })
+  }
+
+  await sendWebhookEvent(s, 'bootstrap.history', {
+    data: { items }, // l’Edge Function crée/actualise conversations/messages pour “remplir” l’UI
+    ts: Date.now()
+  })
 }
 
 async function onConnectionUpdate(s: SessionState, u: any) {
@@ -267,6 +449,11 @@ async function onConnectionUpdate(s: SessionState, u: any) {
   if (u.qr) {
     s.qr_text = u.qr
     try { s.qr = await QRCode.toDataURL(u.qr) } catch { s.qr = null }
+    // informer le backend qu'une session est “created/pending”
+    await sendWebhookEvent(s, 'session.created', {
+      data: { sessionId: s.id, qr: s.qr || null, qr_text: s.qr_text || null },
+      ts: Date.now()
+    })
   }
 
   if (u.connection === 'open') {
@@ -279,12 +466,20 @@ async function onConnectionUpdate(s: SessionState, u: any) {
       const num = extractPhoneFromJid(s.meId || '')
       s.meNumber = num || null
       s.phoneNumber = s.meNumber || null
+
+      // webhook URL unique par session + numéro (si dispo)
+      if (SUPABASE_WEBHOOK_URL) {
+        s.webhookUrl = `${SUPABASE_WEBHOOK_URL}?sessionId=${encodeURIComponent(s.id)}&phone=${encodeURIComponent(s.phoneNumber || '')}`
+      }
     }
 
     await sendWebhookEvent(s, 'session.connected', {
       data: { meId: s.meId || null, phoneNumber: s.meNumber || null },
       ts: Date.now()
     })
+
+    // seed initial: 10 conversations (évite l'effet vide)
+    setTimeout(() => pushInitialHistorySeed(s).catch(() => {}), 3000)
     return
   }
 
@@ -314,54 +509,45 @@ async function onConnectionUpdate(s: SessionState, u: any) {
   }
 }
 
-async function onMessagesUpsert(s: SessionState, m: any) {
-  const msg = m.messages?.[0]
-  if (!msg || !msg.key) return
-
-  const remoteJid = msg.key.remoteJid || ''
-  const fromMe = msg.key.fromMe === true
-  const chatNumber = extractPhoneFromJid(remoteJid)
-
-  const text =
-    msg.message?.conversation ||
-    msg.message?.extendedTextMessage?.text ||
-    msg.message?.imageMessage?.caption ||
-    msg.message?.videoMessage?.caption ||
-    msg.message?.documentMessage?.caption ||
-    ''
-
-  const mediaInfo = await saveIncomingMedia(msg) // may be null
-
-  // update chat timestamp for sidebar ordering
-  const base = s.chats.get(remoteJid) ?? ensureChat(remoteJid)
-  const tsSec = Number(msg.messageTimestamp || 0)
-  s.chats.set(remoteJid, { ...base, conversationTimestamp: tsSec })
-
-  const eventName = fromMe ? 'message.out' : 'message.in'
-
-  await sendWebhookEvent(s, eventName, {
-    data: {
-      from: chatNumber || remoteJid,
-      fromJid: remoteJid,
-      fromMe,
-      text,
-      media: mediaInfo || null,
-      timestampMs: tsSec * 1000
-    },
-    ts: Date.now()
-  })
-}
-
-function attachSocketHandlers(s: SessionState, sock: ReturnType<typeof makeWASocket>) {
-  if (s.saveCreds) sock.ev.on('creds.update', s.saveCreds)
-  sock.ev.on('connection.update', async (u) => onConnectionUpdate(s, u))
-  sock.ev.on('messages.upsert', async (m) => onMessagesUpsert(s, m))
-  wireChatContactStores(s, sock)
-}
-
 // -------------------------
 // SESSION LIFECYCLE
 // -------------------------
+async function buildSocket(s: SessionState) {
+  const waLogger = pino({ level: process.env.WA_LOG_LEVEL || 'info', name: `wa:${s.id}` })
+
+  const sock = makeWASocket({
+    auth: (s as any).authState || undefined,
+    logger: waLogger,
+    browser: Browsers.macOS('Desktop'),
+    syncFullHistory: FULL_HISTORY,
+    markOnlineOnConnect: MARK_ONLINE,
+    printQRInTerminal: false,
+
+    // requis par Baileys (resend, polls)
+    getMessage: async (key: WAMessageKey) => {
+      const k = mkMsgKey(key)
+      return k ? s.messageStore.get(k) : undefined
+    },
+
+    // cache group metadata pour limiter les fetchs
+    cachedGroupMetadata: async (jid: string) => {
+      let md = s.groupCache.get(jid)
+      if (!md && s.sock) {
+        try {
+          md = await s.sock.groupMetadata(jid)
+          if (md) s.groupCache.set(jid, md, 3600)
+        } catch {}
+      }
+      return md
+    },
+
+    connectTimeoutMs: 60_000,
+    defaultQueryTimeoutMs: 60_000
+  })
+
+  return sock
+}
+
 async function restartSession(id: string) {
   const s = sessions.get(id)
   if (!s) return
@@ -376,19 +562,11 @@ async function restartSession(id: string) {
   s.qr_text = null
 
   const { state, saveCreds } = await useMultiFileAuthState(path.join(AUTH_DIR, id))
-  const { version } = await fetchLatestBaileysVersion()
   s.saveCreds = saveCreds
+  ;(s as any).authState = state
 
-  const sock = makeWASocket({
-    version,
-    auth: state,
-    printQRInTerminal: false,
-    browser: ['Zuria', 'Chrome', '120.0.0.0'],
-    connectTimeoutMs: 60_000,
-    defaultQueryTimeoutMs: 60_000
-  })
+  const sock = await buildSocket(s)
   s.sock = sock
-
   attachSocketHandlers(s, sock)
 }
 
@@ -396,7 +574,6 @@ async function startSession(id: string) {
   fs.mkdirSync(path.join(AUTH_DIR, id), { recursive: true })
 
   const { state, saveCreds } = await useMultiFileAuthState(path.join(AUTH_DIR, id))
-  const { version } = await fetchLatestBaileysVersion()
 
   const s: SessionState = {
     id,
@@ -408,17 +585,25 @@ async function startSession(id: string) {
     meId: null,
     meNumber: null,
     chats: new Map(),
-    contacts: new Map()
+    contacts: new Map(),
+    messageStore: new Map(),
+    groupCache: new NodeCache({ stdTTL: 3600 }),
+    queue: [],
+    sending: false,
+    lastMinuteWindowStart: Date.now(),
+    sentInCurrentMinute: 0
+  }
+  ;(s as any).authState = state
+
+  // secret par session (HMAC)
+  s.webhookSecret = crypto.randomBytes(32).toString('hex')
+
+  // si on connaît déjà l’Edge Function → URL unique par session (phone ajouté plus tard)
+  if (SUPABASE_WEBHOOK_URL) {
+    s.webhookUrl = `${SUPABASE_WEBHOOK_URL}?sessionId=${encodeURIComponent(s.id)}`
   }
 
-  const sock = makeWASocket({
-    version,
-    auth: state,
-    printQRInTerminal: false,
-    browser: ['Zuria', 'Chrome', '120.0.0.0'],
-    connectTimeoutMs: 60_000,
-    defaultQueryTimeoutMs: 60_000
-  })
+  const sock = await buildSocket(s)
   s.sock = sock
 
   sessions.set(id, s)
@@ -431,7 +616,7 @@ async function startSession(id: string) {
 // ROUTES
 // -------------------------
 
-// Tiny dashboard (debug)
+// mini-dashboard debug
 app.get('/', async (_req, reply) => {
   const html = `
   <html>
@@ -470,7 +655,7 @@ app.get('/', async (_req, reply) => {
   reply.type('text/html').send(html)
 })
 
-// test UI for send
+// UI d’envoi test
 app.get('/send', async (_req, reply) => {
   const html = `
   <html>
@@ -528,11 +713,23 @@ app.get('/send', async (_req, reply) => {
   reply.type('text/html').send(html)
 })
 
-// create session
+// create session — auto webhook + secret de session
 app.post('/sessions', async (_req, reply) => {
   const id = uuid()
   app.log.info({ msg: 'create session', id })
   const s = await startSession(id)
+
+  // webhook dès la création (avant connexion)
+  if (SUPABASE_WEBHOOK_URL) {
+    s.webhookUrl = `${SUPABASE_WEBHOOK_URL}?sessionId=${encodeURIComponent(s.id)}`
+  }
+
+  // notify backend pour créer la ligne whatsapp_sessions si tu veux centraliser côté Edge Function
+  await sendWebhookEvent(s, 'session.created', {
+    data: { sessionId: s.id },
+    ts: Date.now()
+  })
+
   await new Promise(res => setTimeout(res, 500))
   return reply.send({ session_id: s.id })
 })
@@ -564,8 +761,7 @@ app.post('/sessions/:id/restart', async (req, reply) => {
   return reply.send({ ok: true })
 })
 
-// register webhook
-// body: { url: "https://....?session=xxx", secret?: "..." }
+// (optionnel) reconfigurer webhook explicitement
 app.post('/sessions/:id/webhook', async (req, reply) => {
   const id = (req.params as any).id
   const s = sessions.get(id)
@@ -580,7 +776,7 @@ app.post('/sessions/:id/webhook', async (req, reply) => {
   return reply.send({ ok: true, session_id: id, webhookUrl: s.webhookUrl })
 })
 
-// send message
+// envoyer message — passe par la queue anti-ban
 app.post('/messages', async (req, reply) => {
   if (API_KEY) {
     const hdr = req.headers['x-api-key']
@@ -592,17 +788,24 @@ app.post('/messages', async (req, reply) => {
   if (!s?.sock) return reply.code(400).send({ error: 'session not ready' })
 
   const jid = `${String(to).replace(/[^\d]/g, '')}@s.whatsapp.net`
-  await s.sock.sendMessage(jid, { text: String(text || '') })
 
-  await sendWebhookEvent(s, 'message.out', {
-    data: { to: jid, text: String(text || '') },
-    ts: Date.now()
+  await new Promise<void>((res, rej) => {
+    enqueueSend(s, async () => {
+      const resMsg = await s.sock!.sendMessage(jid, { text: String(text || '') })
+      const k = mkMsgKey(resMsg?.key)
+      if (k) s.messageStore.set(k, resMsg?.message)
+
+      await sendWebhookEvent(s, 'message.out', {
+        data: { to: jid, text: String(text || ''), key: resMsg?.key },
+        ts: Date.now()
+      })
+    }).then(res).catch(rej)
   })
 
   return reply.send({ ok: true })
 })
 
-// paginated chats (for sidebar Live WhatsApp)
+// paginated chats
 app.get('/sessions/:id/chats', async (req, reply) => {
   const id = (req.params as any).id
   const s = sessions.get(id)
@@ -645,7 +848,7 @@ app.get('/sessions/:id/chats', async (req, reply) => {
   return reply.send({ ok: true, chats, nextBeforeTs })
 })
 
-// paginated messages in a given chat
+// messages d’un chat
 app.get('/sessions/:id/chats/:jid/messages', async (req, reply) => {
   const { id, jid } = (req.params as any)
   const s = sessions.get(id)
@@ -686,6 +889,10 @@ app.get('/sessions/:id/chats/:jid/messages', async (req, reply) => {
       ''
     const messageId = m.key?.id || ''
     const tsMs = Number(m.messageTimestamp || 0) * 1000
+
+    const k = mkMsgKey(m.key)
+    if (k) s.messageStore.set(k, m.message)
+
     return {
       messageId,
       fromMe,
@@ -702,15 +909,13 @@ app.get('/sessions/:id/chats/:jid/messages', async (req, reply) => {
   return reply.send({ ok: true, messages, nextCursor })
 })
 
-// full logout + purge credentials
+// logout + purge
 app.post('/sessions/:id/logout', async (req, reply) => {
   const id = (req.params as any).id
   const s = sessions.get(id)
   if (!s) return reply.code(404).send({ error: 'unknown session' })
 
-  try {
-    if (s.sock) await s.sock.logout()
-  } catch (e: any) {
+  try { if (s.sock) await s.sock.logout() } catch (e: any) {
     app.log.warn({ msg: 'logout() threw', id, err: String(e) })
   }
 
@@ -740,7 +945,7 @@ app.post('/sessions/:id/logout', async (req, reply) => {
 app.get('/health', async (_req, reply) => reply.send({ ok: true }))
 
 // -------------------------
-// BOOTSTRAP (no top-level await)
+// BOOTSTRAP
 // -------------------------
 async function bootstrap() {
   await app.register(cors, { origin: true })
@@ -754,3 +959,13 @@ async function bootstrap() {
     })
 }
 bootstrap()
+
+/**
+ * Points clés:
+ * - Webhook auto par session (SUPABASE_WEBHOOK_URL), secret HMAC par session.
+ * - Events: session.created/connected/disconnected, message.in/out, bootstrap.history, ...
+ * - syncFullHistory + Desktop UA => seed 10 convos au connect.
+ * - getMessage + logger (requis/recommandés Baileys).
+ * - Queue d'envoi + pacing (anti-ban).
+ * - ⚠️ useMultiFileAuthState: OK en MVP; prévoir un store DB/Redis en prod.
+ */
