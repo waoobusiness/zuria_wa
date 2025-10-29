@@ -196,6 +196,9 @@ function hmacSha256Hex(secret: string, body: string) {
   return crypto.createHmac('sha256', secret).update(body).digest('hex')
 }
 
+// >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+// sendWebhookEvent (PATCHÉ)
+// >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
 async function sendWebhookEvent(
   s: SessionState,
   event: string,
@@ -205,17 +208,33 @@ async function sendWebhookEvent(
     app.log.warn({ msg: 'no webhookUrl for session, drop event', sessionId: s.id, event })
     return
   }
-  const secret = s.webhookSecret || WEBHOOK_SECRET_FALLBACK || ''
-  const body = { sessionId: s.id, event, ...payload }
+
+  // special case: le tout premier event "session.created"
+  // On signe avec le secret global fallback (WEBHOOK_SECRET_FALLBACK),
+  // et on envoie aussi le vrai secret de session dans le body pour que Supabase l'enregistre.
+  const isBootstrap = event === 'session.created'
+
+  const secretToUse = isBootstrap
+    ? (WEBHOOK_SECRET_FALLBACK || s.webhookSecret || '')
+    : (s.webhookSecret || WEBHOOK_SECRET_FALLBACK || '')
+
+  const body = {
+    sessionId: s.id,
+    event,
+    ...(isBootstrap ? { sessionSecret: s.webhookSecret } : {}),
+    ...payload
+  }
+
   const json = JSON.stringify(body)
-  const sig = hmacSha256Hex(secret, json)
+  const sig = hmacSha256Hex(secretToUse, json)
 
   try {
     const res = await fetch(s.webhookUrl, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'x-wa-signature': sig
+        'x-wa-signature': sig,
+        'x-wa-sig-version': isBootstrap ? 'bootstrap-v1' : 'session-v1'
       },
       body: json
     })
@@ -224,8 +243,8 @@ async function sendWebhookEvent(
     app.log.error({ msg: 'webhook push failed', sessionId: s.id, event, err: String(e) })
   }
 }
+// >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
 
-// envoi avec pacing/queue par session (anti-ban)
 async function enqueueSend(s: SessionState, task: () => Promise<void>) {
   s.queue.push(task)
   if (!s.sending) {
@@ -543,7 +562,7 @@ async function buildSocket(s: SessionState) {
 
     // cache group metadata pour limiter les fetchs
     cachedGroupMetadata: async (jid: string) => {
-      // >>> FIX TYPESCRIPT: force any pour ne pas renvoyer unknown
+      // Typescript: NodeCache.get() renvoie unknown → on cast en any
       let md: any = s.groupCache.get(jid) as any
       if (!md && s.sock) {
         try {
@@ -608,7 +627,7 @@ async function startSession(id: string) {
   }
   ;(s as any).authState = state
 
-  // secret par session (HMAC)
+  // secret par session (HMAC privé pour signer les futurs webhooks)
   s.webhookSecret = crypto.randomBytes(32).toString('hex')
 
   // URL webhook de base (sans numéro tant qu'on ne connaît pas encore le phone)
@@ -626,7 +645,7 @@ async function startSession(id: string) {
 }
 
 // -------------------------
-// ROUTES
+// ROUTES HTTP DU GATEWAY
 // -------------------------
 
 // mini-dashboard debug
@@ -668,7 +687,7 @@ app.get('/', async (_req, reply) => {
   reply.type('text/html').send(html)
 })
 
-// UI d’envoi test
+// UI test d’envoi
 app.get('/send', async (_req, reply) => {
   const html = `
   <html>
@@ -726,18 +745,18 @@ app.get('/send', async (_req, reply) => {
   reply.type('text/html').send(html)
 })
 
-// create session — auto webhook + secret de session
+// créer une session WhatsApp
 app.post('/sessions', async (_req, reply) => {
   const id = uuid()
   app.log.info({ msg: 'create session', id })
   const s = await startSession(id)
 
-  // webhook dès la création (avant connexion)
+  // webhook dès la création
   if (SUPABASE_WEBHOOK_URL) {
     s.webhookUrl = `${SUPABASE_WEBHOOK_URL}?sessionId=${encodeURIComponent(s.id)}`
   }
 
-  // notify backend pour créer la ligne whatsapp_sessions côté Supabase
+  // informer Supabase (session.created)
   await sendWebhookEvent(s, 'session.created', {
     data: { sessionId: s.id },
     ts: Date.now()
@@ -747,7 +766,7 @@ app.post('/sessions', async (_req, reply) => {
   return reply.send({ session_id: s.id })
 })
 
-// get session state
+// lire état d'une session
 app.get('/sessions/:id', async (req, reply) => {
   const id = (req.params as any).id
   const s = sessions.get(id)
@@ -765,7 +784,7 @@ app.get('/sessions/:id', async (req, reply) => {
   })
 })
 
-// restart socket
+// relancer la session
 app.post('/sessions/:id/restart', async (req, reply) => {
   const id = (req.params as any).id
   const s = sessions.get(id)
@@ -774,7 +793,7 @@ app.post('/sessions/:id/restart', async (req, reply) => {
   return reply.send({ ok: true })
 })
 
-// (optionnel) reconfigurer webhook explicitement
+// configurer (ou reconfigurer) le webhook manuellement
 app.post('/sessions/:id/webhook', async (req, reply) => {
   const id = (req.params as any).id
   const s = sessions.get(id)
@@ -789,7 +808,7 @@ app.post('/sessions/:id/webhook', async (req, reply) => {
   return reply.send({ ok: true, session_id: id, webhookUrl: s.webhookUrl })
 })
 
-// envoyer message — passe par la queue anti-ban
+// envoyer un message WhatsApp (passe par file d'attente anti-ban)
 app.post('/messages', async (req, reply) => {
   if (API_KEY) {
     const hdr = req.headers['x-api-key']
@@ -802,14 +821,12 @@ app.post('/messages', async (req, reply) => {
 
   const jid = `${String(to).replace(/[^\d]/g, '')}@s.whatsapp.net`
 
-  // on wrappe dans enqueueSend pour respecter le pacing
   await new Promise<void>((res, rej) => {
     enqueueSend(s, async () => {
       const resMsg = await s.sock!.sendMessage(jid, { text: String(text || '') })
 
       const k = mkMsgKey(resMsg?.key)
       if (k) {
-        // FIX TYPESCRIPT: si jamais resMsg?.message vaut null, on le force à undefined
         const safeMessage = (resMsg as any)?.message ?? undefined
         s.messageStore.set(k, safeMessage)
       }
@@ -824,7 +841,7 @@ app.post('/messages', async (req, reply) => {
   return reply.send({ ok: true })
 })
 
-// paginated chats
+// lister les chats récents
 app.get('/sessions/:id/chats', async (req, reply) => {
   const id = (req.params as any).id
   const s = sessions.get(id)
@@ -867,7 +884,7 @@ app.get('/sessions/:id/chats', async (req, reply) => {
   return reply.send({ ok: true, chats, nextBeforeTs })
 })
 
-// messages d’un chat
+// lister les messages d'un chat
 app.get('/sessions/:id/chats/:jid/messages', async (req, reply) => {
   const { id, jid } = (req.params as any)
   const s = sessions.get(id)
@@ -980,10 +997,3 @@ async function bootstrap() {
     })
 }
 bootstrap()
-
-/**
- * Fixes par rapport à la build Render qui a échoué :
- * - cachedGroupMetadata: cast explicite en `any` pour ne plus retourner `unknown`.
- * - messageStore.set(...) : on convertit `null` éventuel en `undefined` avant set().
- * Tout le reste (webhook HMAC, pacing anti-ban, seed 10 convos) reste identique.
- */
