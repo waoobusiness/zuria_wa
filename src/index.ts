@@ -1,8 +1,5 @@
 // src/index.ts
 
-// -------------------------
-// IMPORTS
-// -------------------------
 import Fastify from 'fastify'
 import fastifyStatic from '@fastify/static'
 import cors from '@fastify/cors'
@@ -24,75 +21,72 @@ import crypto from 'crypto'
 // CONFIG
 // -------------------------
 const PORT = parseInt(process.env.PORT || '3001', 10)
-const AUTH_DIR = process.env.AUTH_DIR || './.wa'
+const AUTH_DIR = process.env.AUTH_DIR || '/var/data/wa'
 const MEDIA_DIR = process.env.MEDIA_DIR || path.join(AUTH_DIR, 'media')
 
-// utilisé pour exposer les médias téléchargés
+// URL publique de ton service Render (pour servir les médias)
 const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || 'https://zuria-wa.onrender.com').replace(/\/$/, '')
 
-// secret GLOBAL partagé Render ↔ Supabase pour signer le premier webhook session.created
-const WEBHOOK_SECRET_GLOBAL = process.env.WEBHOOK_SECRET || ''
+// URL de l'Edge Function Supabase
+const SUPABASE_WEBHOOK_URL = process.env.SUPABASE_WEBHOOK_URL || ''
 
-// URL de l’Edge Function Supabase (whatsapp-webhook-gateway)
-const SUPABASE_WEBHOOK_URL =
-  (process.env.SUPABASE_WEBHOOK_URL || '').replace(/\/$/, '')
+// Secret GLOBAL partagé Render <-> Supabase pour signer l'event "session.created"
+const WA_WEBHOOK_SECRET = process.env.WA_WEBHOOK_SECRET || ''
+
+// Clé API optionnelle pour /messages, /chats, etc.
+const API_KEY = process.env.API_KEY || ''
+
 
 // -------------------------
-// TYPES & MEMORY
+// TYPES & MÉMOIRE
 // -------------------------
 
 type ChatLite = {
   id: string
   name?: string | null
   subject?: string | null
-  /** seconds since epoch (Baileys) */
-  conversationTimestamp?: number | null
+  conversationTimestamp?: number | null // seconds since epoch (Baileys)
 }
 
 type SessionState = {
   id: string
 
-  // QR pour affichage dans / (tableau de bord debug)
+  // QR codes pour l'UI
   qr?: string | null
   qr_text?: string | null
 
-  // état connexion
+  // connection status
   connected: boolean
 
-  // socket Baileys
+  // l'instance Baileys
   sock?: ReturnType<typeof makeWASocket>
 
   // sauvegarde creds baileys
   saveCreds?: () => Promise<void>
 
-  // URL webhook pour cette session vers Supabase
-  // ex: https://.../whatsapp-webhook-gateway?session_id=<sessionId>
-  webhookUrl?: string
+  // secret spécifique à CETTE session,
+  // utilisé pour signer tous les webhooks APRES "session.created"
+  sessionSecret: string
 
-  // secret unique POUR CETTE SESSION
-  // (on l'envoie à Supabase dans session.created;
-  // ensuite tous les events hors session.created sont signés avec ça)
-  sessionSecret?: string
-
-  // infos compte whatsapp
+  // info compte
   meId?: string | null
   meNumber?: string | null
   phoneNumber?: string | null
 
-  // stores mémoire pour l'UI temps réel /chats et /messages
+  // mini-stores
   chats: Map<string, ChatLite>
   contacts: Map<string, { notify?: string; name?: string }>
 }
 
-// toutes les sessions actives en RAM
 const sessions = new Map<string, SessionState>()
+
 
 // -------------------------
 // FASTIFY INSTANCE
 // -------------------------
 const app = Fastify({ logger: true })
 
-// parse JSON permissif (corps vide => {})
+// JSON parser permissif
 app.addContentTypeParser('application/json', { parseAs: 'string' }, (req, body, done) => {
   try {
     if (!body || (typeof body === 'string' && body.trim() === '')) {
@@ -106,21 +100,23 @@ app.addContentTypeParser('application/json', { parseAs: 'string' }, (req, body, 
   }
 })
 
-// accepter /api/... en le réécrivant en /...
+// Support du prefix /api/* (Render health checks etc.)
 app.addHook('onRequest', (req, _reply, done) => {
   if (req.url.startsWith('/api/')) {
-    // @ts-ignore override fastify readonly
+    // @ts-ignore override read-only
     req.url = req.url.slice(4)
   }
   done()
 })
 
-// s'assurer que le dossier media existe
+// s'assurer que le dossier medias existe
 fs.mkdirSync(MEDIA_DIR, { recursive: true })
 
+
 // -------------------------
-// HELPERS
+// HELPERS LOCALES
 // -------------------------
+
 function extractPhoneFromJid(jid?: string | null): string | null {
   if (!jid) return null
   const m = jid.match(/^(\d{5,20})/)
@@ -193,96 +189,87 @@ function isRestartRequired(err: any) {
   return code === 515 || code === DisconnectReason.restartRequired
 }
 
-// ----- HMAC SIGNATURE (Render -> Supabase) -----
-function hmacHex(secret: string, bodyObj: Record<string, any>): string {
-  const body = JSON.stringify(bodyObj)
-  return crypto.createHmac('sha256', secret).update(body).digest('hex')
+// ---------------
+// HMAC SIGNATURE
+// ---------------
+function signBodyHmacSha256(secret: string, body: any): string {
+  const raw = JSON.stringify(body)
+  return crypto.createHmac('sha256', secret).update(raw).digest('hex')
 }
 
-/**
- * Envoie un webhook vers Supabase.
- *
- * event = "session.created" | "session.connected" | "session.disconnected" | "message.in" | "message.out" | etc.
- *
- * Règle de signature:
- *  - "session.created"  -> signé avec le secret GLOBAL (WEBHOOK_SECRET_GLOBAL)
- *  - tout le reste      -> signé avec le secret DE LA SESSION (s.sessionSecret)
- */
+// ---------------
+// Webhook sender
+// ---------------
 async function sendWebhookEvent(
   s: SessionState,
-  event: string,
+  eventName: string,
   payload: Record<string, any>
 ) {
-  // Construire l'URL webhook une fois qu'on connaît la session
-  // Format attendu par Supabase: .../whatsapp-webhook-gateway?session_id=<sessionId>
-  const url = s.webhookUrl || (SUPABASE_WEBHOOK_URL
-    ? `${SUPABASE_WEBHOOK_URL}?session_id=${s.id}`
-    : '')
-
-  if (!url) {
-    app.log.warn({ msg: 'no webhook URL configured, drop event', sessionId: s.id, event })
+  if (!SUPABASE_WEBHOOK_URL) {
+    app.log.warn({ msg: 'No SUPABASE_WEBHOOK_URL configured, dropping webhook', eventName })
     return
   }
 
-  // Corps envoyé à Supabase.
-  // IMPORTANT: structure adaptée à l’Edge Function actuelle.
+  // corps du webhook
   const body = {
     session_id: s.id,
-    event,
-    data: payload
+    sessionId: s.id,
+    event: eventName,
+    data: payload,
+    ts: Date.now()
   }
 
-  // On choisit quel secret utiliser pour signer
-  const secretToUse = event === 'session.created'
-    ? WEBHOOK_SECRET_GLOBAL              // global pour le tout premier handshake
-    : (s.sessionSecret || '')            // secret unique stocké en DB par Supabase après session.created
+  // secret utilisé:
+  // - si c'est la création de session => secret global WA_WEBHOOK_SECRET
+  // - sinon => secret par session
+  const secretToUse = eventName === 'session.created'
+    ? WA_WEBHOOK_SECRET
+    : s.sessionSecret
 
   if (!secretToUse) {
-    app.log.warn({
-      msg: 'no signing secret available for webhook',
-      sessionId: s.id,
-      event
-    })
+    app.log.error({ msg: 'No secret available for webhook signing', eventName, sessionId: s.id })
+    return
   }
 
-  const signature = hmacHex(secretToUse, body)
+  // HMAC
+  const sig = signBodyHmacSha256(secretToUse, body)
 
+  const url = `${SUPABASE_WEBHOOK_URL}?session_id=${encodeURIComponent(s.id)}`
   try {
     const res = await fetch(url, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'x-wa-signature': signature,
-        'x-wa-sig-version': '1'
+        'x-wa-signature': sig
       },
       body: JSON.stringify(body)
     })
-
     app.log.info({
-      class: 'WEBHOOK DEBUG SENT',
+      class: 'webhookPush',
       sessionId: s.id,
-      event,
-      url,
+      event: eventName,
       status: res.status
     })
-  } catch (e) {
+  } catch (e: any) {
     app.log.error({
       msg: 'webhook push failed',
       sessionId: s.id,
-      event,
+      event: eventName,
       err: String(e)
     })
   }
 }
 
+
 // -------------------------
-// BAILEYS EVENT WIRING
+// BAILEYS HANDLERS
 // -------------------------
 
 function ensureChat(id: string): ChatLite {
   return { id, name: null, subject: null, conversationTimestamp: null }
 }
 
+// Mets à jour notre mini store chats/contacts à chaque event Baileys
 function wireChatContactStores(s: SessionState, sock: ReturnType<typeof makeWASocket>) {
   const setChats = (arr: any[]) => {
     for (const c of arr || []) {
@@ -294,7 +281,9 @@ function wireChatContactStores(s: SessionState, sock: ReturnType<typeof makeWASo
         conversationTimestamp:
           (typeof c.conversationTimestamp === 'number'
             ? c.conversationTimestamp
-            : Number(c.conversationTimestamp || 0)) || base.conversationTimestamp || 0
+            : Number(c.conversationTimestamp || 0)) ||
+          base.conversationTimestamp ||
+          0
       })
     }
   }
@@ -330,13 +319,13 @@ function wireChatContactStores(s: SessionState, sock: ReturnType<typeof makeWASo
 async function onConnectionUpdate(s: SessionState, u: any) {
   app.log.info({
     wa_update: {
-      connection: u.connection,
+      conn: u.connection,
       hasQR: !!u.qr,
       disc: !!u.lastDisconnect
     }
   })
 
-  // si on reçoit un QR -> garder pour l'UI
+  // QR ?
   if (u.qr) {
     s.qr_text = u.qr
     try {
@@ -346,37 +335,34 @@ async function onConnectionUpdate(s: SessionState, u: any) {
     }
   }
 
-  // connecté
+  // connecté !
   if (u.connection === 'open') {
     s.connected = true
     s.qr = null
     s.qr_text = null
 
-    // récupérer info du compte localement
-    const me = (s.sock as any)?.user
-    if (me?.id) {
-      s.meId = me.id
-      const num = extractPhoneFromJid(me.id)
+    if (u.me?.id) {
+      s.meId = u.me.id || null
+      const num = extractPhoneFromJid(s.meId || '')
       s.meNumber = num || null
       s.phoneNumber = s.meNumber || null
     }
 
-    // avertir Supabase (signé avec le secret session car ce n'est pas "session.created")
+    // envoie "session.connected" à Supabase
     await sendWebhookEvent(s, 'session.connected', {
       jid: s.meId || null,
-      phone_number: s.meNumber || null,
-      ts: Date.now()
+      phone_number: s.meNumber || null
     })
+
     return
   }
 
-  // fermé
+  // fermé ?
   if (u.connection === 'close') {
     const err = (u.lastDisconnect as any)?.error
 
-    // cas: restart nécessaire
     if (isRestartRequired(err)) {
-      app.log.warn({ msg: 'restart required (515)', id: s.id })
+      app.log.warn({ msg: 'restart required (515) — restarting socket', id: s.id })
       await restartSession(s.id)
       return
     }
@@ -388,15 +374,13 @@ async function onConnectionUpdate(s: SessionState, u: any) {
         err?.statusCode ??
         0
     )
-
-    // cas: logged out -> il faut rescanner
     if (code === DisconnectReason.loggedOut) {
       s.connected = false
       app.log.warn({ msg: 'logged out — rescan required', id: s.id })
 
+      // push "session.disconnected"
       await sendWebhookEvent(s, 'session.disconnected', {
-        reason: 'loggedOut',
-        ts: Date.now()
+        reason: 'loggedOut'
       })
       return
     }
@@ -413,7 +397,6 @@ async function onMessagesUpsert(s: SessionState, m: any) {
   const fromMe = msg.key.fromMe === true
   const chatNumber = extractPhoneFromJid(remoteJid)
 
-  // texte ou caption
   const text =
     msg.message?.conversation ||
     msg.message?.extendedTextMessage?.text ||
@@ -422,48 +405,43 @@ async function onMessagesUpsert(s: SessionState, m: any) {
     msg.message?.documentMessage?.caption ||
     ''
 
-  // récupérer media si présent, le sauver sur disque, générer l’URL publique
   const mediaInfo = await saveIncomingMedia(msg) // peut être null
 
-  // mettre à jour l’horodatage de la conversation pour l’UI /chats
+  // met à jour last timestamp pour tri dans /chats
   const base = s.chats.get(remoteJid) ?? ensureChat(remoteJid)
   const tsSec = Number(msg.messageTimestamp || 0)
   s.chats.set(remoteJid, { ...base, conversationTimestamp: tsSec })
 
   const eventName = fromMe ? 'message.out' : 'message.in'
 
-  // pousser dans Supabase
   await sendWebhookEvent(s, eventName, {
     from: chatNumber || remoteJid,
     fromJid: remoteJid,
     fromMe,
     text,
     media: mediaInfo || null,
+    chatNumber: chatNumber || null,
     timestampMs: tsSec * 1000
   })
 }
 
-function attachSocketHandlers(
-  s: SessionState,
-  sock: ReturnType<typeof makeWASocket>
-) {
+function attachSocketHandlers(s: SessionState, sock: ReturnType<typeof makeWASocket>) {
   if (s.saveCreds) sock.ev.on('creds.update', s.saveCreds)
   sock.ev.on('connection.update', async (u) => onConnectionUpdate(s, u))
   sock.ev.on('messages.upsert', async (m) => onMessagesUpsert(s, m))
   wireChatContactStores(s, sock)
 }
 
+
 // -------------------------
 // SESSION LIFECYCLE
 // -------------------------
-
 async function restartSession(id: string) {
   const s = sessions.get(id)
   if (!s) return
 
   app.log.warn({ msg: 'restart WA session', id })
 
-  // nettoyer anciens listeners/socket
   try { (s.sock as any)?.ev?.removeAllListeners?.() } catch {}
   try { (s.sock as any)?.ws?.close?.() } catch {}
   s.sock = undefined
@@ -471,7 +449,6 @@ async function restartSession(id: string) {
   s.qr = null
   s.qr_text = null
 
-  // recharger l'état d'auth
   const { state, saveCreds } = await useMultiFileAuthState(path.join(AUTH_DIR, id))
   const { version } = await fetchLatestBaileysVersion()
   s.saveCreds = saveCreds
@@ -490,19 +467,13 @@ async function restartSession(id: string) {
 }
 
 async function startSession(id: string) {
-  // chaque session a son propre dossier d'auth
   fs.mkdirSync(path.join(AUTH_DIR, id), { recursive: true })
 
   const { state, saveCreds } = await useMultiFileAuthState(path.join(AUTH_DIR, id))
   const { version } = await fetchLatestBaileysVersion()
 
-  // générer un secret UNIQUE pour CETTE session
-  const sessionSecret = crypto.randomBytes(32).toString('hex')
-
-  // construire l'URL webhook pour Supabase pour cette session
-  const fullWebhookUrl = SUPABASE_WEBHOOK_URL
-    ? `${SUPABASE_WEBHOOK_URL}?session_id=${id}`
-    : undefined
+  // secret unique de cette session, qui va dans Supabase
+  const perSessionSecret = uuid()
 
   const s: SessionState = {
     id,
@@ -513,13 +484,11 @@ async function startSession(id: string) {
     phoneNumber: null,
     meId: null,
     meNumber: null,
+    sessionSecret: perSessionSecret,
     chats: new Map(),
-    contacts: new Map(),
-    sessionSecret,
-    webhookUrl: fullWebhookUrl
+    contacts: new Map()
   }
 
-  // ouvrir la connexion WhatsApp
   const sock = makeWASocket({
     version,
     auth: state,
@@ -533,25 +502,20 @@ async function startSession(id: string) {
   sessions.set(id, s)
   attachSocketHandlers(s, sock)
 
-  // === ENVOI IMMÉDIAT DE session.created ===
-  // signé avec le secret GLOBAL (WEBHOOK_SECRET_GLOBAL)
-  // Supabase va:
-  //  - vérifier la signature
-  //  - faire un UPSERT dans whatsapp_sessions
-  //  - stocker sessionSecret dans whatsapp_sessions.webhook_secret
+  // -> webhook "session.created"
   await sendWebhookEvent(s, 'session.created', {
-    sessionSecret,
-    phone: null
+    sessionSecret: perSessionSecret
   })
 
   return s
 }
 
+
 // -------------------------
-// ROUTES HTTP
+// ROUTES HTTP (API + mini dashboard)
 // -------------------------
 
-// Mini dashboard debug
+// Mini dashboard HTML
 app.get('/', async (_req, reply) => {
   const html = `
   <html>
@@ -565,23 +529,34 @@ app.get('/', async (_req, reply) => {
         const r = await fetch('/sessions', {method:'POST'})
         const j = await r.json()
         const out = document.getElementById('out')
-        out.innerHTML = '<p><b>Session:</b> '+j.session_id+'</p>'
-                       + '<img id="qr" style="width:300px;border:1px solid #ccc"/>'
-                       + '<div id="stat"></div>'
+        out.innerHTML = '<p><b>Session:</b> <span id="sid">'+j.session_id+'</span></p>'
+                       + '<img id="qr" style="width:300px;border:1px solid #ccc;display:block;margin-bottom:8px"/>'
+                       + '<div id="stat">⏳ En attente...</div>'
         const img = document.getElementById('qr')
         const stat = document.getElementById('stat')
+        const sid = j.session_id
+
         const interval = setInterval(async ()=>{
-          const r2 = await fetch('/sessions/'+j.session_id)
+          const r2 = await fetch('/sessions/'+sid)
           const s = await r2.json()
+
           if(s.qr){ img.src = s.qr }
           else if (s.qr_text) {
             img.src = 'https://api.qrserver.com/v1/create-qr-code/?size=300x300&data='
                       + encodeURIComponent(s.qr_text)
+          } else {
+            img.style.display = 'none'
           }
-          stat.textContent = s.connected
-            ? '✅ Connecté ('+(s.phoneNumber||'???')+')'
-            : '⏳ En attente...'
-          if(s.connected){ clearInterval(interval); img.remove() }
+
+          if(s.connected){
+            stat.textContent = '✅ Connecté ('+(s.phoneNumber||'???')+')'
+          } else {
+            stat.textContent = '⏳ En attente...'
+          }
+
+          if(s.connected){
+            clearInterval(interval)
+          }
         }, 1500)
       }
       </script>
@@ -590,7 +565,7 @@ app.get('/', async (_req, reply) => {
   reply.type('text/html').send(html)
 })
 
-// page debug pour envoyer un message manuellement
+// Test UI pour envoi manuel
 app.get('/send', async (_req, reply) => {
   const html = `
   <html>
@@ -602,7 +577,6 @@ app.get('/send', async (_req, reply) => {
         <button id="check">Vérifier statut</button>
         <button id="restart">Relancer</button>
         <button id="logout">Logout complet</button>
-        <button id="seed">Forcer session.created</button>
       </div>
       <label>Numéro (ex: 41760000000)<br/><input id="to" style="width:100%" placeholder="chiffres uniquement"/></label>
       <br/><br/>
@@ -627,11 +601,6 @@ app.get('/send', async (_req, reply) => {
           const r = await fetch('/sessions/' + sid + '/logout', { method: 'POST' })
           out.textContent = JSON.stringify(await r.json(), null, 2)
         }
-        document.getElementById('seed').onclick = async () => {
-          const sid = (document.getElementById('sid').value || '').trim()
-          const r = await fetch('/sessions/' + sid + '/seed-created', { method: 'POST' })
-          out.textContent = JSON.stringify(await r.json(), null, 2)
-        }
         document.getElementById('btn').onclick = async () => {
           const sessionId = (document.getElementById('sid').value || '').trim()
           const to = (document.getElementById('to').value || '').trim()
@@ -654,17 +623,17 @@ app.get('/send', async (_req, reply) => {
   reply.type('text/html').send(html)
 })
 
-// créer une nouvelle session WhatsApp (avec QR)
+// Crée une nouvelle session Baileys
 app.post('/sessions', async (_req, reply) => {
   const id = uuid()
   app.log.info({ msg: 'create session', id })
   const s = await startSession(id)
-  // petite pause pour laisser Baileys commencer et éventuellement générer un QR
+  // petite pause pour laisser Baileys émettre le premier QR
   await new Promise(res => setTimeout(res, 500))
   return reply.send({ session_id: s.id })
 })
 
-// lire l'état d'une session
+// Récupère l'état d'une session
 app.get('/sessions/:id', async (req, reply) => {
   const id = (req.params as any).id
   const s = sessions.get(id)
@@ -682,7 +651,7 @@ app.get('/sessions/:id', async (req, reply) => {
   })
 })
 
-// relancer la socket Baileys pour une session donnée
+// Relance la socket en cas de 515
 app.post('/sessions/:id/restart', async (req, reply) => {
   const id = (req.params as any).id
   const s = sessions.get(id)
@@ -691,32 +660,46 @@ app.post('/sessions/:id/restart', async (req, reply) => {
   return reply.send({ ok: true })
 })
 
-// forcer l'envoi du webhook "session.created" à Supabase
-// utile pour les anciennes sessions créées AVANT ce code
-app.post('/sessions/:id/seed-created', async (req, reply) => {
+// STOP / logout complet
+app.post('/sessions/:id/logout', async (req, reply) => {
   const id = (req.params as any).id
   const s = sessions.get(id)
   if (!s) return reply.code(404).send({ error: 'unknown session' })
 
-  // si pas de secret de session encore présent, on en génère un
-  if (!s.sessionSecret) {
-    s.sessionSecret = crypto.randomBytes(32).toString('hex')
+  try {
+    if (s.sock) await s.sock.logout()
+  } catch (e: any) {
+    app.log.warn({ msg: 'logout() threw', id, err: String(e) })
   }
 
-  if (!s.webhookUrl && SUPABASE_WEBHOOK_URL) {
-    s.webhookUrl = `${SUPABASE_WEBHOOK_URL}?session_id=${id}`
-  }
-
-  await sendWebhookEvent(s, 'session.created', {
-    sessionSecret: s.sessionSecret,
-    phone: s.meNumber || null
+  await sendWebhookEvent(s, 'session.disconnected', {
+    reason: 'manual_logout'
   })
 
-  return reply.send({ ok: true })
+  try { (s.sock as any)?.ev?.removeAllListeners?.() } catch {}
+  try { (s.sock as any)?.ws?.close?.() } catch {}
+  s.sock = undefined
+  s.connected = false
+
+  try {
+    const authPath = path.join(AUTH_DIR, id)
+    fs.rmSync(authPath, { recursive: true, force: true })
+    app.log.info({ msg: 'auth folder deleted', path: authPath })
+  } catch (e: any) {
+    app.log.warn({ msg: 'failed to delete auth folder', err: String(e) })
+  }
+
+  sessions.delete(id)
+  return reply.send({ ok: true, loggedOut: true })
 })
 
-// envoyer un message WhatsApp sortant
+// Envoi manuel de message texte
 app.post('/messages', async (req, reply) => {
+  if (API_KEY) {
+    const hdr = req.headers['x-api-key']
+    if (!hdr || hdr !== API_KEY) return reply.code(401).send({ error: 'unauthorized' })
+  }
+
   const { sessionId, to, text } = (req.body as any) || {}
   const s = sessions.get(sessionId)
   if (!s?.sock) return reply.code(400).send({ error: 'session not ready' })
@@ -724,21 +707,26 @@ app.post('/messages', async (req, reply) => {
   const jid = `${String(to).replace(/[^\d]/g, '')}@s.whatsapp.net`
   await s.sock.sendMessage(jid, { text: String(text || '') })
 
-  // notifier Supabase pour logguer le message sortant
   await sendWebhookEvent(s, 'message.out', {
-    to: jid,
-    text: String(text || ''),
-    ts: Date.now()
+    fromMe: true,
+    fromJid: s.meId || null,
+    chatNumber: String(to).replace(/[^\d]/g, ''),
+    text: String(text || '')
   })
 
   return reply.send({ ok: true })
 })
 
-// récupérer la liste triée des chats pour une session
+// Liste paginée des chats connus
 app.get('/sessions/:id/chats', async (req, reply) => {
   const id = (req.params as any).id
   const s = sessions.get(id)
   if (!s?.sock) return reply.code(400).send({ error: 'session not ready' })
+
+  if (API_KEY) {
+    const hdr = req.headers['x-api-key']
+    if (!hdr || hdr !== API_KEY) return reply.code(401).send({ error: 'unauthorized' })
+  }
 
   const q = (req.query as any) || {}
   const limit = Math.min(Number(q.limit || 20), 50)
@@ -772,11 +760,16 @@ app.get('/sessions/:id/chats', async (req, reply) => {
   return reply.send({ ok: true, chats, nextBeforeTs })
 })
 
-// récupérer les messages d'un chat précis dans une session
+// Liste paginée des messages d'un chat précis
 app.get('/sessions/:id/chats/:jid/messages', async (req, reply) => {
   const { id, jid } = (req.params as any)
   const s = sessions.get(id)
   if (!s?.sock) return reply.code(400).send({ error: 'session not ready' })
+
+  if (API_KEY) {
+    const hdr = req.headers['x-api-key']
+    if (!hdr || hdr !== API_KEY) return reply.code(401).send({ error: 'unauthorized' })
+  }
 
   const q = (req.query as any) || {}
   const limit = Math.min(Number(q.limit || 20), 50)
@@ -826,42 +819,9 @@ app.get('/sessions/:id/chats/:jid/messages', async (req, reply) => {
   return reply.send({ ok: true, messages, nextCursor })
 })
 
-// logout total d'une session + suppression des creds
-app.post('/sessions/:id/logout', async (req, reply) => {
-  const id = (req.params as any).id
-  const s = sessions.get(id)
-  if (!s) return reply.code(404).send({ error: 'unknown session' })
-
-  try {
-    if (s.sock) await s.sock.logout()
-  } catch (e: any) {
-    app.log.warn({ msg: 'logout() threw', id, err: String(e) })
-  }
-
-  await sendWebhookEvent(s, 'session.disconnected', {
-    reason: 'manual_logout',
-    ts: Date.now()
-  })
-
-  try { (s.sock as any)?.ev?.removeAllListeners?.() } catch {}
-  try { (s.sock as any)?.ws?.close?.() } catch {}
-  s.sock = undefined
-  s.connected = false
-
-  try {
-    const authPath = path.join(AUTH_DIR, id)
-    fs.rmSync(authPath, { recursive: true, force: true })
-    app.log.info({ msg: 'auth folder deleted', path: authPath })
-  } catch (e: any) {
-    app.log.warn({ msg: 'failed to delete auth folder', err: String(e) })
-  }
-
-  sessions.delete(id)
-  return reply.send({ ok: true, loggedOut: true })
-})
-
-// healthcheck pour Render
+// health
 app.get('/health', async (_req, reply) => reply.send({ ok: true }))
+
 
 // -------------------------
 // BOOTSTRAP
@@ -877,4 +837,5 @@ async function bootstrap() {
       process.exit(1)
     })
 }
+
 bootstrap()
