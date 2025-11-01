@@ -20,6 +20,10 @@ import fs from 'fs'
 import path from 'path'
 import crypto from 'crypto'
 
+// 👇👇👇 AJOUT
+import carsPlugin from './cars'
+// 👆👆👆 AJOUT
+
 // -------------------------
 // CONFIG
 // -------------------------
@@ -795,6 +799,10 @@ app.get('/health', async (_req, reply) => reply.send({ ok: true }))
 async function bootstrap() {
   await app.register(cors, { origin: true })
   await app.register(fastifyStatic, { root: MEDIA_DIR, prefix: '/media/' })
+
+  // 👇👇👇 AJOUT — monte tout le vertical "Cars" sous /cars/*
+  await app.register(carsPlugin, { prefix: '/cars' })
+  // 👆👆👆 AJOUT
 
   app.listen({ port: PORT, host: '0.0.0.0' })
     .then(() => app.log.info(`HTTP server listening on ${PORT}`))
