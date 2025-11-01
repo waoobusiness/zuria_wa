@@ -1,6 +1,7 @@
 // src/cars/index.ts
 import type { FastifyInstance, FastifyPluginOptions } from "fastify";
 import resolverPlugin from "./resolver"; // ← fichier de l'étape 2 (src/cars/resolver.ts)
+import carsPlugin from './cars' // ← AJOUT
 
 export default async function carsPlugin(app: FastifyInstance, _opts: FastifyPluginOptions) {
   // ping: GET /cars/health
