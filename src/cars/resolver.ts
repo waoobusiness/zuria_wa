@@ -1,8 +1,4 @@
-// src/resolver.ts
-// Fastify plugin "resolver" — 0 dépendance externe, parse HTML en best-effort.
-// Objectif : accepter un lien véhicule OU vendeur AutoScout24, retrouver le dealer,
-// paginer l’inventaire, et renvoyer un JSON "summary" ou "full".
-
+// src/cars/resolver.ts
 import type { FastifyInstance, FastifyPluginOptions } from "fastify";
 
 type Depth = "summary" | "full";
@@ -15,14 +11,13 @@ const UA =
 const RE_DEALER_URL = /^https?:\/\/(?:www\.)?autoscout24\.ch\/(fr|de|it)\/s\/seller-(\d+)\/?/i;
 const RE_VEHICLE_URL = /^https?:\/\/(?:www\.)?autoscout24\.ch\/(fr|de|it)\/d\/.+-(\d+)\/?/i;
 
-// --- types de sortie ---
 type Dealer = {
-  id: string;                 // "seller-24860"
-  name?: string | null;       // "Carmotion AG"
-  profile_url: string;        // dealer page
-  rating?: number | null;     // 4.8
-  reviews_count?: number | null; // 308
-  address?: string | null;    // (best effort)
+  id: string;
+  name?: string | null;
+  profile_url: string;
+  rating?: number | null;
+  reviews_count?: number | null;
+  address?: string | null;
   default_lang?: string | null;
 };
 
@@ -54,13 +49,13 @@ type VehicleDetails = {
 };
 
 type VehicleItem = {
-  id?: string | null;   // id numérique dans l’URL
-  url: string;          // lien absolu de la fiche
+  id?: string | null;
+  url: string;
   brand?: string | null;
   model?: string | null;
   title?: string | null;
   price_chf?: number | null;
-  year_month_reg?: string | null; // "2023-10"
+  year_month_reg?: string | null;
   mileage_km?: number | null;
   fuel?: string | null;
   transmission?: string | null;
@@ -75,15 +70,9 @@ type ConnectOut = {
   inventory: { total: number; items: VehicleItem[] };
 };
 
-// --- helpers ---
+// ---------- helpers ----------
 const abs = (href: string) =>
   href.startsWith("http") ? href : new URL(href, BASE).toString();
-
-const priceToInt = (txt?: string | null) => {
-  if (!txt) return undefined;
-  const m = txt.replace(/’/g, "'").match(/(\d[\d'\s]*)/);
-  return m ? parseInt(m[1].replace(/[^0-9]/g, ""), 10) : undefined;
-};
 
 async function fetchHtml(url: string): Promise<string> {
   const res = await fetch(url, { headers: { "user-agent": UA, accept: "text/html" } as any });
@@ -91,15 +80,24 @@ async function fetchHtml(url: string): Promise<string> {
   return await res.text();
 }
 
+function extractText(html: string) {
+  return html
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 function findDealerLinkInVehicle(html: string): string | undefined {
-  // attr data-testid change, on scanne tous les <a href="/fr|de|it/s/seller-XXXXX">
+  // <a href="/fr|de|it/s/seller-XXXXX">
   const re = /href="\/(fr|de|it)\/s\/seller-(\d+)"/gi;
   const m = re.exec(html);
-  return m ? abs(`/` + m[1] + `/s/seller-` + m[2]) : undefined;
+  return m ? abs(`/${m[1]}/s/seller-${m[2]}`) : undefined;
 }
 
 function extractListingLinks(html: string): Array<{ url: string; label?: string }> {
-  // repère les cartes: <a ... data-testid="listing-card-0" ... href="/fr/d/xxx-12345678" aria-label="...">
+  // <a data-testid="listing-card-*" href="/fr/d/..." aria-label="...">
   const out: Array<{ url: string; label?: string }> = [];
   const re = /<a[^>]+data-testid="listing-card-[^"]+"[^>]*href="([^"]+)"[^>]*?(?:aria-label="([^"]*)")?/gi;
   let m: RegExpExecArray | null;
@@ -112,17 +110,7 @@ function extractListingLinks(html: string): Array<{ url: string; label?: string 
   return out;
 }
 
-function extractText(html: string) {
-  // enlève les balises grossièrement pour repérages simples
-  return html
-    .replace(/<script[\s\S]*?<\/script>/gi, " ")
-    .replace(/<style[\s\S]*?<\/style>/gi, " ")
-    .replace(/<[^>]+>/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function vehicleQuickFactsFromText(text: string) {
+function extractTextFacts(text: string) {
   const o: any = {};
   const ym = text.match(/(\d{2})\.(\d{4})/);
   if (ym) o.year_month_reg = `${ym[2]}-${ym[1]}`;
@@ -134,49 +122,40 @@ function vehicleQuickFactsFromText(text: string) {
   if (chf) o.price_chf = parseInt(chf[1].replace(/[^0-9]/g, ""), 10);
   const fuels = ["Essence","Diesel","Hybride","Électrique","Benzin","Hybrid","Elektrisch","Elektro"];
   for (const f of fuels) if (text.includes(f)) { o.fuel = f; break; }
-  // puissance (ex: 306 PS (225 kW))
   const ps = text.match(/(\d+)\s*PS\s*\((\d+)\s*kW\)/i);
   if (ps) { o.power_ps = parseInt(ps[1], 10); o.power_kw = parseInt(ps[2], 10); }
-  // efficacité énergétique (A..G)
   const eff = text.match(/\b([A-G])\b\s*(Étiquette|Energie|Effizienz|energy)/i);
   if (eff) o.efficiency_label = eff[1];
   return o;
 }
 
 function brandModelFromUrl(url: string) {
-  // .../d/mercedes-benz-gla-35-amg-4matic-...-12877180
   const m = /\/d\/([^-\/]+)-([a-z0-9\-]+)/i.exec(url);
   if (!m) return {};
-  const brand = m[1]?.replace(/-/g, " ");
-  const modelPart = m[2]?.replace(/-/g, " ");
-  return { brand: capitalizeWords(brand), model: capitalizeWords(modelPart) };
+  const cap = (s?: string) =>
+    s ? s.split(" ").map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(" ") : s;
+  return { brand: cap(m[1]?.replace(/-/g," ")), model: cap(m[2]?.replace(/-/g," ")) };
 }
-const capitalizeWords = (s?: string) =>
-  s ? s.split(" ").map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(" ") : s;
 
-async function parseVehiclePage(url: string): Promise<{ dealerUrl: string; item: VehicleItem; text: string; html: string; }> {
+async function parseVehiclePage(url: string) {
   const html = await fetchHtml(url);
   const text = extractText(html);
   const dealerUrl = findDealerLinkInVehicle(html);
   if (!dealerUrl) throw new Error("Dealer link not found on vehicle page");
 
   const id = (RE_VEHICLE_URL.exec(url)?.[2]) || null;
-
-  // Titre (premier <h1>…</h1> ou aria-label fallback)
   const h1m = /<h1[^>]*>(.*?)<\/h1>/i.exec(html);
   const title = h1m ? h1m[1].replace(/<[^>]+>/g, "").trim() : undefined;
 
-  const facts = vehicleQuickFactsFromText(text);
+  const facts = extractTextFacts(text);
   const { brand, model } = brandModelFromUrl(url);
 
   const pics: string[] = [];
-  if (true) {
-    const reImg = /<img[^>]+src="([^"]+)"[^>]*>/gi;
-    let m: RegExpExecArray | null;
-    while ((m = reImg.exec(html))) {
-      const src = m[1];
-      if (/(autoscout24|cloudfront|cdn)/i.test(src)) pics.push(src);
-    }
+  const reImg = /<img[^>]+src="([^"]+)"[^>]*>/gi;
+  let mi: RegExpExecArray | null;
+  while ((mi = reImg.exec(html))) {
+    const src = mi[1];
+    if (/(autoscout24|cloudfront|cdn)/i.test(src)) pics.push(src);
   }
 
   const item: VehicleItem = {
@@ -192,13 +171,11 @@ async function parseVehiclePage(url: string): Promise<{ dealerUrl: string; item:
     details: null
   };
 
-  // détails "full" seront remplis plus bas si demandé
   return { dealerUrl, item, text, html };
 }
 
 function buildDetailsFrom(text: string, html: string, includeMedia: boolean): VehicleDetails {
   const kv = (label: string) => {
-    // lit "Cylindrée 1'991 cm³" ou "Prix catalogue CHF 80'230"
     const r = new RegExp(label + "\\s*([\\w’'°/\\.\\-\\s\\(\\)]+)", "i");
     const m = r.exec(text);
     return m ? m[1].trim() : undefined;
@@ -208,13 +185,10 @@ function buildDetailsFrom(text: string, html: string, includeMedia: boolean): Ve
   const d: VehicleDetails = {};
   const ps = text.match(/(\d+)\s*PS\s*\((\d+)\s*kW\)/i);
   if (ps) { d.power_ps = parseInt(ps[1], 10); d.power_kw = parseInt(ps[2], 10); }
-
   const cons = text.match(/(\d+[.,]?\d*)\s*l\/100\s*km/i);
   if (cons) d.consumption_l_100km = parseFloat(cons[1].replace(",", "."));
-
   const co2 = text.match(/(\d+)\s*g\/km/i);
   if (co2) d.co2_g_km = parseInt(co2[1], 10);
-
   const eff = text.match(/\b([A-G])\b\s*(Étiquette|Energie|Effizienz|energy)/i);
   if (eff) d.efficiency_label = eff[1];
 
@@ -224,7 +198,6 @@ function buildDetailsFrom(text: string, html: string, includeMedia: boolean): Ve
   d.catalog_price_chf = toInt(kv("Prix catalogue") || kv("Listenpreis"));
   d.doors = toInt(kv("Portes") || kv("Türen"));
   d.seats = toInt(kv("Sièges") || kv("Sitzplätze"));
-
   if (/4x4|4 roues motrices|Allrad/i.test(text)) d.drivetrain = "4x4";
   if (/SUV|Tout-terrain/i.test(text)) d.body_type = "SUV / Tout-terrain";
 
@@ -246,7 +219,6 @@ function buildDetailsFrom(text: string, html: string, includeMedia: boolean): Ve
   d.ct_expertisee = yesNo("Expertisée") ?? undefined;
   d.warranty = kv("Garantie") ?? undefined;
 
-  // finance snippets
   const finance = text.match(
     /(Ab\s+[0-9’'\.\s\-]+CHF\s+pro\s+Monat[^\n]*)|(À\s+partir\s+de\s+CHF\s*[0-9’'\.\s]+[^\n]*par\s+mois[^\n]*)/gi
   );
@@ -263,7 +235,6 @@ function buildDetailsFrom(text: string, html: string, includeMedia: boolean): Ve
     d.media = imgs.length ? imgs : null;
   }
 
-  // description : plus long paragraphe
   const paras = text.split(/(?<=\.)\s+/).filter(s => s.length > 60);
   d.description = paras.sort((a,b) => b.length - a.length)[0] || null;
 
@@ -274,19 +245,14 @@ async function parseDealerPage(url: string): Promise<Dealer> {
   const html = await fetchHtml(url);
   const text = extractText(html);
 
-  // nom : premier <h1>
   const name = /<h1[^>]*>(.*?)<\/h1>/i.exec(html)?.[1]?.replace(/<[^>]+>/g,"").trim() || null;
-
-  // rating & reviews : "4.8 (308)"
   const rate = /(\d\.\d)\s*\((\d+)\)/.exec(text);
   const rating = rate ? parseFloat(rate[1]) : null;
   const reviews = rate ? parseInt(rate[2], 10) : null;
-
-  // adresse (best effort)
-  const addr = text.match(/\b\d{4}\s+[A-Za-zÀ-ÿ\-]+/); // ex "8307 Effretikon"
+  const addr = text.match(/\b\d{4}\s+[A-Za-zÀ-ÿ\-]+/);
   const address = addr ? addr[0] : null;
-
   const m = RE_DEALER_URL.exec(url);
+
   return {
     id: m ? `seller-${m[2]}` : url,
     name,
@@ -298,7 +264,7 @@ async function parseDealerPage(url: string): Promise<Dealer> {
   };
 }
 
-async function paginateInventory(dealerUrl: string, maxPages = 80): Promise<Array<{url:string; label?:string}>> {
+async function paginateInventory(dealerUrl: string, maxPages = 80) {
   const items: Array<{url:string; label?:string}> = [];
   const seen = new Set<string>();
   for (let page = 1; page <= maxPages; page++) {
@@ -330,25 +296,21 @@ async function scrapeFull(url: string, includeMedia: boolean): Promise<VehicleIt
   return item;
 }
 
-export default async function resolverPlugin(fastify: FastifyInstance, _opts: FastifyPluginOptions) {
-  // petit ping
-  fastify.get("/connect/health", async () => ({ ok: true, resolver: "fastify", version: "1.0.0" }));
+export default async function resolverPlugin(app: FastifyInstance, _opts: FastifyPluginOptions) {
+  app.get("/connect/health", async () => ({ ok: true, scope: "cars", version: "1.0.0" }));
 
-  // endpoint principal
-  fastify.post<{ Body: { url: string; depth?: Depth; include_media?: boolean; locale?: Locale } }>(
+  app.post<{ Body: { url: string; depth?: Depth; include_media?: boolean; locale?: Locale } }>(
     "/connect",
     async (req, reply) => {
       const { url, depth = "full", include_media = true } = req.body || {};
       if (!url || (!RE_VEHICLE_URL.test(url) && !RE_DEALER_URL.test(url))) {
         return reply.status(400).send({ detail: "URL invalide: fournir un lien AutoScout24 (fiche véhicule ou page vendeur)." });
       }
-
       try {
         let dealerUrl: string;
         let source_type: "vehicle" | "dealer" = "dealer";
 
         if (RE_VEHICLE_URL.test(url)) {
-          // partir d'une fiche véhicule, retrouver le vendeur
           const v = await parseVehiclePage(url);
           dealerUrl = v.dealerUrl;
           source_type = "vehicle";
@@ -360,12 +322,11 @@ export default async function resolverPlugin(fastify: FastifyInstance, _opts: Fa
         const dealer = await parseDealerPage(dealerUrl);
         const cards = await paginateInventory(dealerUrl);
 
-        // limite la charge par lots de 5 requêtes
+        // pool (5 en //) pour limiter la charge
         const pool = async <T>(arr: Array<any>, fn: (x:any)=>Promise<T>, size=5) => {
           const out: T[] = [];
           for (let i=0; i<arr.length; i+=size) {
-            const chunk = arr.slice(i, i+size);
-            const part = await Promise.all(chunk.map(x => fn(x)));
+            const part = await Promise.all(arr.slice(i, i+size).map(x => fn(x)));
             out.push(...part);
           }
           return out;
