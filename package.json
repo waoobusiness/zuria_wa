@@ -13,7 +13,8 @@
     "@whiskeysockets/baileys": "^6.7.1",
     "fastify": "^4.28.1",
     "qrcode": "^1.5.3",
-    "uuid": "^9.0.1"
+    "uuid": "^9.0.1",
+    "link-preview-js": "^5.0.0"
   },
   "devDependencies": {
     "@types/node": "^20.12.12",
