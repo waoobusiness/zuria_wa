@@ -944,6 +944,12 @@ app.post("/wa/send/text", async (req: Request, res: Response) => {
       .json({ ok: false, error: "orgId,to,text required" });
   }
 
+  // 🔎 Log brut de ce que reçoit la gateway
+  logger.info(
+    { body: req.body },
+    "GW /wa/send/text incoming payload"
+  );
+
   const s = getSessionOr404(String(orgId), res);
   if (!s) return;
 
@@ -968,7 +974,19 @@ app.post("/wa/send/text", async (req: Request, res: Response) => {
       (content as any).mentions = mentions.map((p: string) => phoneToJid(p));
     }
 
+    // 🔎 Log juste avant l’envoi Baileys
+    logger.info(
+      { jid, content, options },
+      "GW /wa/send/text before sendMessage"
+    );
+
     const sent = await s.sock!.sendMessage(jid, content, options);
+
+    // 🔎 Log après envoi
+    logger.info(
+      { key: sent?.key },
+      "GW /wa/send/text sent"
+    );
 
     // Webhook: message sortant (via Zuria)
     void postWebhook("message.outgoing", String(orgId), {
@@ -980,6 +998,10 @@ app.post("/wa/send/text", async (req: Request, res: Response) => {
 
     res.json({ ok: true, key: sent.key });
   } catch (err) {
+    logger.error(
+      { err: String(err), orgId, to, text },
+      "GW /wa/send/text error"
+    );
     res.status(500).json({ ok: false, error: String(err) });
   }
 });
