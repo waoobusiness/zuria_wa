@@ -673,6 +673,19 @@ async function startSession(orgId: string): Promise<Session> {
         ? Object.keys(msg.message)[0]
         : undefined;
       const body = extractMessageBody(msg);
+          // 🧪 LOG SPÉCIAL : messages sortants contenant "zuria.ai/tradein"
+    if (msg.key.fromMe && body?.includes("zuria.ai/tradein")) {
+      logger.info(
+        {
+          orgId,
+          key: msg.key,
+          messageType,
+          body,
+          rawMessage: msg.message,
+        },
+        "GW OUTGOING TRADEIN MESSAGE"
+      );
+    }
 
       const simplified = {
         id: msg.key.id,
