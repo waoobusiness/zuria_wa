@@ -928,7 +928,16 @@ app.post("/wa/logout", async (req: Request, res: Response) => {
 // ----------- ENVOI DE MESSAGES (OUTBOUND) + webhook
 
 app.post("/wa/send/text", async (req: Request, res: Response) => {
-  const { orgId, to, text, quotedMsgId, mentions } = req.body || {};
+  const {
+    orgId,
+    to,
+    text,
+    quotedMsgId,
+    mentions,
+    link_preview,
+    linkPreview,
+  } = req.body || {};
+
   if (!orgId || !to || !text) {
     return res
       .status(400)
@@ -946,6 +955,12 @@ app.post("/wa/send/text", async (req: Request, res: Response) => {
       options.quoted = {
         key: { id: quotedMsgId, fromMe: false, remoteJid: jid },
       };
+    }
+
+    // ✅ Active le link preview natif de Baileys si demandé
+    const enablePreview = link_preview ?? linkPreview;
+    if (enablePreview) {
+      options.linkPreview = true;
     }
 
     const content: AnyMessageContent = { text: String(text) };
@@ -968,6 +983,7 @@ app.post("/wa/send/text", async (req: Request, res: Response) => {
     res.status(500).json({ ok: false, error: String(err) });
   }
 });
+
 
 app.post("/wa/send/image", async (req: Request, res: Response) => {
   const { orgId, to, caption, image } = req.body || {};
