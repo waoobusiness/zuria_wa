@@ -996,6 +996,97 @@ app.post("/wa/logout", async (req: Request, res: Response) => {
   res.json({ ok: true });
 });
 
+// ----------- LID Resolver (PN -> LID)
+
+// Auth optionnelle: si WA_API_KEY (ou GATEWAY_API_KEY / WA_GATEWAY_API_KEY) est défini
+// et AUTH_DISABLED n'est pas activé, alors on exige une clé.
+const AUTH_DISABLED =
+  String(process.env.AUTH_DISABLED || "").toLowerCase() === "1" ||
+  String(process.env.AUTH_DISABLED || "").toLowerCase() === "true";
+
+const WA_API_KEY =
+  process.env.WA_API_KEY ||
+  process.env.GATEWAY_API_KEY ||
+  process.env.WA_GATEWAY_API_KEY ||
+  "";
+
+function checkAuth(req: Request, res: Response): boolean {
+  if (AUTH_DISABLED) return true;
+  if (!WA_API_KEY) return true;
+
+  const headerKey =
+    (req.headers["x-api-key"] as string) ||
+    (req.headers["x-gateway-key"] as string) ||
+    "";
+
+  const auth = (req.headers["authorization"] as string) || "";
+  const bearer = auth.toLowerCase().startsWith("bearer ")
+    ? auth.slice(7).trim()
+    : "";
+
+  const provided = headerKey || bearer;
+
+  if (!provided || provided !== WA_API_KEY) {
+    res.status(401).json({ ok: false, error: "unauthorized" });
+    return false;
+  }
+
+  return true;
+}
+
+app.post("/wa/resolve", async (req: Request, res: Response) => {
+  if (!checkAuth(req, res)) return;
+
+  const { orgId, to, sendTest, testText } = req.body || {};
+
+  if (!orgId || !to) {
+    return res
+      .status(400)
+      .json({ ok: false, error: "orgId,to required" });
+  }
+
+  const s = getSessionOr404(String(orgId), res);
+  if (!s) return;
+
+  try {
+    // 1) resolve via cache / lidMapping
+    const before = await resolveSendJid(s, String(to));
+
+    let sentKey: any = null;
+    let after = before;
+
+    // 2) option: envoyer un ping réel (utile si mapping pas encore "chaud")
+    if (Boolean(sendTest)) {
+      const text = String(testText || "ping");
+
+      logger.info(
+        { orgId, to, before, text },
+        "GW /wa/resolve sendTest: sending ping"
+      );
+
+      const sent = await s.sock!.sendMessage(before.sendTo, { text });
+      sentKey = sent?.key || null;
+
+      // petite pause pour laisser Baileys enrichir lidMapping si ça arrive
+      await new Promise((r) => setTimeout(r, 700));
+
+      after = await resolveSendJid(s, String(to));
+    }
+
+    return res.json({
+      ok: true,
+      orgId: String(orgId),
+      input: String(to),
+      before, // { pn, lid, sendTo }
+      after,  // { pn, lid, sendTo }
+      sentKey,
+    });
+  } catch (err) {
+    logger.error({ err, orgId, to }, "GW /wa/resolve error");
+    return res.status(500).json({ ok: false, error: String(err) });
+  }
+});
+
 // ----------- ENVOI DE MESSAGES (OUTBOUND) + webhook
 
 app.post("/wa/send/text", async (req: Request, res: Response) => {
