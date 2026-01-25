@@ -79,6 +79,10 @@ type Session = {
   msgCache: LRUCache<string, WAMessage>;
   chats: Map<string, ChatSummary>;
   contacts: Map<string, ContactSummary>;
+
+  // ✅ caches PN <-> LID (résout ton problème de double conversations)
+  lidByPn: LRUCache<string, string>; // key: 4179..@s.whatsapp.net -> value: xxx@lid
+  pnByLid: LRUCache<string, string>; // key: xxx@lid -> value: 4179..@s.whatsapp.net
 };
 
 const sessions = new Map<string, Session>();
@@ -92,6 +96,9 @@ function createEmptySession(orgId: string): Session {
     msgCache: new LRUCache({ max: 1000 }),
     chats: new Map(),
     contacts: new Map(),
+
+    lidByPn: new LRUCache({ max: 5000 }),
+    pnByLid: new LRUCache({ max: 5000 }),
   };
 }
 
@@ -107,6 +114,82 @@ function getBus(orgId: string): EventEmitter {
 function phoneToJid(to: string): string {
   const digits = to.replace(/[^\d]/g, "").replace(/^00/, "");
   return `${digits}@s.whatsapp.net`;
+}
+
+function isLidJid(jid?: string | null): boolean {
+  return !!jid && jid.endsWith("@lid");
+}
+
+function isPnJid(jid?: string | null): boolean {
+  return !!jid && jid.endsWith("@s.whatsapp.net");
+}
+
+function computeCanonicalChatId(
+  remoteJid?: string | null,
+  remoteJidAlt?: string | null
+): string | null {
+  // ✅ Canonical = LID si on l'a, sinon PN
+  if (remoteJid && isLidJid(remoteJid)) return remoteJid;
+  if (remoteJidAlt && isLidJid(remoteJidAlt)) return remoteJidAlt;
+  return remoteJid || remoteJidAlt || null;
+}
+
+function getRemoteJidAlt(msg: WAMessage): string | null {
+  // Baileys v7 fournit remoteJidAlt sur msg.key (si dispo)
+  return (((msg.key as any)?.remoteJidAlt as string) || null) ?? null;
+}
+
+function rememberLidMapping(sess: Session, pnJid: string, lidJid: string) {
+  if (!pnJid || !lidJid) return;
+  if (!isPnJid(pnJid) || !isLidJid(lidJid)) return;
+
+  sess.lidByPn.set(pnJid, lidJid);
+  sess.pnByLid.set(lidJid, pnJid);
+}
+
+function rememberFromKey(sess: Session, remoteJid?: string | null, remoteJidAlt?: string | null) {
+  if (!remoteJid || !remoteJidAlt) return;
+
+  if (isLidJid(remoteJid) && isPnJid(remoteJidAlt)) {
+    rememberLidMapping(sess, remoteJidAlt, remoteJid);
+  } else if (isPnJid(remoteJid) && isLidJid(remoteJidAlt)) {
+    rememberLidMapping(sess, remoteJid, remoteJidAlt);
+  }
+}
+
+async function resolveSendJid(
+  sess: Session,
+  toPhone: string
+): Promise<{ pn: string; lid: string | null; sendTo: string }> {
+  const pn = phoneToJid(toPhone);
+
+  // 1) cache d'abord
+  const cached = sess.lidByPn.get(pn);
+  if (cached) return { pn, lid: cached, sendTo: cached };
+
+  // 2) essayer lidMapping du signalRepository (Baileys v7)
+  let lid: string | null = null;
+  try {
+    const sockAny: any = sess.sock as any;
+    const lm = sockAny?.signalRepository?.lidMapping;
+
+    // différentes implémentations selon builds
+    if (lm?.getLIDForPN) {
+      lid = await lm.getLIDForPN(pn);
+    } else if (typeof lm?.get === "function") {
+      // certaines versions exposent .get(pn)
+      lid = await lm.get(pn);
+    }
+  } catch (err) {
+    logger.warn({ err, pn }, "resolveSendJid: lid lookup failed");
+  }
+
+  if (lid && isLidJid(lid)) {
+    rememberLidMapping(sess, pn, lid);
+    return { pn, lid, sendTo: lid };
+  }
+
+  return { pn, lid: null, sendTo: pn };
 }
 
 async function bufferFromInput(input?: { url?: string; base64?: string }) {
@@ -151,18 +234,13 @@ async function clearSessionAuth(orgId: string) {
 
 // ----------- Helpers divers
 
-// ✅ NOUVELLE VERSION : on NE considère pas @lid, @g.us, status, etc. comme des numéros de téléphone
+// ✅ On NE considère pas @lid, @g.us, status, etc. comme des numéros de téléphone
 function jidToPhone(jid?: string | null): string | null {
   if (!jid) return null;
 
   const [local, domain] = jid.split("@");
   if (!local) return null;
 
-  // Cas à ignorer pour le "numéro" :
-  // - LID (identifiants internes Business / multi-device)
-  // - groupes
-  // - status / broadcast / newsletters
-  // - JID contenant un "-" (souvent groupes)
   if (
     domain === "lid" ||
     domain === "g.us" ||
@@ -237,16 +315,18 @@ async function postWebhook(
 
 // ----------- Helper: payload style Z-API pour un message
 
-function buildZapiLikeMessage(
-  msg: WAMessage,
-  sess: Session,
-  orgId: string
-): any {
+function buildZapiLikeMessage(msg: WAMessage, sess: Session, orgId: string): any {
   const m: any = msg.message || {};
   const connectedPhone = getConnectedPhone(sess);
 
-  const remoteJid = msg.key.remoteJid as string | undefined;
-  const phone = jidToPhone(remoteJid || "");
+  const remoteJid = (msg.key.remoteJid as string | undefined) || null;
+  const remoteJidAlt = getRemoteJidAlt(msg);
+
+  // ✅ si remoteJid = @lid, on essaie d'extraire le phone depuis remoteJidAlt
+  const phone =
+    jidToPhone(remoteJid || "") ||
+    jidToPhone(remoteJidAlt || "");
+
   const isGroup = (remoteJid || "").endsWith("@g.us");
   const fromMe = !!msg.key.fromMe;
   const tsSec = Number(msg.messageTimestamp || 0) || 0;
@@ -254,6 +334,7 @@ function buildZapiLikeMessage(
 
   const contact =
     (remoteJid && sess.contacts.get(remoteJid)) ||
+    (remoteJidAlt && sess.contacts.get(remoteJidAlt)) ||
     (phone ? sess.contacts.get(`${phone}@s.whatsapp.net`) : undefined);
 
   const displayName =
@@ -261,11 +342,14 @@ function buildZapiLikeMessage(
     contact?.shortName ||
     (msg as any).pushName ||
     phone ||
+    remoteJidAlt ||
     remoteJid;
+
+  const chatIdCanonical = computeCanonicalChatId(remoteJid, remoteJidAlt);
 
   const base: any = {
     isStatusReply: false,
-    chatLid: null, // pas dispo avec Baileys
+    chatLid: null,
     connectedPhone,
     waitingMessage: false,
     isEdit: false,
@@ -273,10 +357,19 @@ function buildZapiLikeMessage(
     isNewsletter: false,
     instanceId: orgId,
     messageId: msg.key.id,
-    // ✅ on ajoute explicitement ces 2 champs pour Supabase / Lovable
+
+    // ✅ identifiants
     remoteJid: remoteJid || null,
+    remoteJidAlt: remoteJidAlt || null,
+
+    // compat: ancien champ
     chatId: remoteJid || null,
-    phone, // peut être null pour @lid / groupes
+
+    // ✅ nouveaux champs pour merger côté Supabase
+    chatIdAlt: remoteJidAlt || null,
+    chatIdCanonical,
+
+    phone, // peut être null
     fromMe,
     momment: tsMs,
     status: fromMe ? "SENT" : "RECEIVED",
@@ -430,20 +523,18 @@ async function startSession(orgId: string): Promise<Session> {
 
   sessions.set(orgId, sess);
 
- const sock = makeWASocket({
-  version,
-  printQRInTerminal: false,
-  auth: {
-    creds: state.creds,
-    keys: makeCacheableSignalKeyStore(state.keys, logger),
-  },
-  browser: ["Zuria", "Chrome", "1.0.0"],
-  logger,
-  // on ne demande PAS l'historique complet, ça réduit la charge et la phase "AwaitingInitialSync"
-  syncFullHistory: false,
-  markOnlineOnConnect: false,
-});
-
+  const sock = makeWASocket({
+    version,
+    printQRInTerminal: false,
+    auth: {
+      creds: state.creds,
+      keys: makeCacheableSignalKeyStore(state.keys, logger),
+    },
+    browser: ["Zuria", "Chrome", "1.0.0"],
+    logger,
+    syncFullHistory: false,
+    markOnlineOnConnect: false,
+  });
 
   sess.sock = sock;
   sess.saveCreds = saveCreds;
@@ -471,10 +562,7 @@ async function startSession(orgId: string): Promise<Session> {
       getBus(orgId).emit("status", { type: "connected", user: sock.user });
       logger.info({ orgId }, "WA connected");
 
-      // Webhook: statut connecté
-      void postWebhook("connection.open", orgId, {
-        user: sock.user,
-      });
+      void postWebhook("connection.open", orgId, { user: sock.user });
       return;
     }
 
@@ -483,37 +571,26 @@ async function startSession(orgId: string): Promise<Session> {
       const code: number =
         (lastDisconnect as any)?.error?.output?.statusCode ?? 0;
 
-      // Codes qu’on considère comme "non récupérables"
       const fatalCodes: number[] = [
-        DisconnectReason.loggedOut, // 401
-        DisconnectReason.forbidden, // 403
+        DisconnectReason.loggedOut,
+        DisconnectReason.forbidden,
         DisconnectReason.badSession,
-        DisconnectReason.connectionReplaced, // 410
+        DisconnectReason.connectionReplaced,
       ];
 
       const willReconnect = !fatalCodes.includes(code);
 
       sess!.status = "closed";
-      getBus(orgId).emit("status", {
-        type: "closed",
-        code,
-        willReconnect,
-      });
+      getBus(orgId).emit("status", { type: "closed", code, willReconnect });
 
       logger.warn({ orgId, code, willReconnect }, "WA closed");
 
-      // Webhook: statut fermé
-      void postWebhook("connection.close", orgId, {
-        code,
-        willReconnect,
-      });
+      void postWebhook("connection.close", orgId, { code, willReconnect });
 
       if (!willReconnect) {
-        // on supprime la session en mémoire & disque
         sessions.delete(orgId);
         clearSessionAuth(orgId).catch(() => {});
       } else {
-        // 🔁 cas 515 / restartRequired & co → on relance la session avec les mêmes creds
         setTimeout(() => {
           logger.info({ orgId, code }, "auto-restart WA session");
           startSession(orgId).catch((err) =>
@@ -531,26 +608,25 @@ async function startSession(orgId: string): Promise<Session> {
     if (Array.isArray(chats)) {
       for (const c of chats) {
         const summary = normalizeChat(c);
-        if (summary) {
-          sess!.chats.set(summary.id, summary);
-        }
+        if (summary) sess!.chats.set(summary.id, summary);
       }
     }
 
     if (Array.isArray(contacts)) {
       for (const c of contacts) {
         const summary = normalizeContact(c);
-        if (summary) {
-          sess!.contacts.set(summary.id, summary);
-        }
+        if (summary) sess!.contacts.set(summary.id, summary);
       }
     }
 
     if (Array.isArray(messages)) {
       for (const msg of messages as WAMessage[]) {
-        if (msg.key && msg.key.id) {
-          sess!.msgCache.set(msg.key.id, msg);
-        }
+        if (msg.key && msg.key.id) sess!.msgCache.set(msg.key.id, msg);
+
+        // ✅ on profite de l'historique si remoteJidAlt est présent pour enrichir le mapping
+        const rj = (msg.key.remoteJid as string | undefined) || null;
+        const rja = getRemoteJidAlt(msg);
+        rememberFromKey(sess!, rj, rja);
       }
     }
 
@@ -560,9 +636,6 @@ async function startSession(orgId: string): Promise<Session> {
       chats: Array.from(sess!.chats.values()),
       contacts: Array.from(sess!.contacts.values()),
     });
-
-    // ❗ On NE pousse PAS cet historique vers le webhook
-    // => tu as dit que les anciens historiques ne t’intéressent pas pour le scoring
   });
 
   // Chats & contacts live updates
@@ -588,8 +661,7 @@ async function startSession(orgId: string): Promise<Session> {
 
     for (const u of updates || []) {
       const id = u.id as string;
-      const existing =
-        sess!.chats.get(id) || ({ id } as ChatSummary);
+      const existing = sess!.chats.get(id) || ({ id } as ChatSummary);
 
       const merged: ChatSummary = {
         ...existing,
@@ -601,9 +673,7 @@ async function startSession(orgId: string): Promise<Session> {
             : existing.lastMessageTimestamp,
       };
 
-      if (u.name || u.subject) {
-        merged.name = u.name || u.subject;
-      }
+      if (u.name || u.subject) merged.name = u.name || u.subject;
 
       sess!.chats.set(id, merged);
       updated.push(merged);
@@ -627,10 +697,7 @@ async function startSession(orgId: string): Promise<Session> {
     }
 
     if (updated.length) {
-      getBus(orgId).emit("contacts", {
-        type: "upsert",
-        contacts: updated,
-      });
+      getBus(orgId).emit("contacts", { type: "upsert", contacts: updated });
     }
   });
 
@@ -639,8 +706,7 @@ async function startSession(orgId: string): Promise<Session> {
 
     for (const u of updates || []) {
       const id = u.id as string;
-      const existing =
-        sess!.contacts.get(id) || ({ id } as ContactSummary);
+      const existing = sess!.contacts.get(id) || ({ id } as ContactSummary);
 
       const merged: ContactSummary = {
         ...existing,
@@ -654,10 +720,7 @@ async function startSession(orgId: string): Promise<Session> {
     }
 
     if (updated.length) {
-      getBus(orgId).emit("contacts", {
-        type: "update",
-        contacts: updated,
-      });
+      getBus(orgId).emit("contacts", { type: "update", contacts: updated });
     }
   });
 
@@ -665,31 +728,38 @@ async function startSession(orgId: string): Promise<Session> {
   sock.ev.on("messages.upsert", (m: any) => {
     const up = m.messages || [];
     for (const msg of up as WAMessage[]) {
-      if (msg.key && msg.key.id) {
-        sess!.msgCache.set(msg.key.id, msg);
+      if (msg.key && msg.key.id) sess!.msgCache.set(msg.key.id, msg);
+
+      const messageType = msg.message ? Object.keys(msg.message)[0] : undefined;
+      const body = extractMessageBody(msg);
+
+      // 🧪 LOG SPÉCIAL : messages sortants contenant "zuria.ai/tradein"
+      if (msg.key.fromMe && body?.includes("zuria.ai/tradein")) {
+        logger.info(
+          {
+            orgId,
+            key: msg.key,
+            messageType,
+            body,
+            rawMessage: msg.message,
+          },
+          "GW OUTGOING TRADEIN MESSAGE"
+        );
       }
 
-      const messageType = msg.message
-        ? Object.keys(msg.message)[0]
-        : undefined;
-      const body = extractMessageBody(msg);
-          // 🧪 LOG SPÉCIAL : messages sortants contenant "zuria.ai/tradein"
-    if (msg.key.fromMe && body?.includes("zuria.ai/tradein")) {
-      logger.info(
-        {
-          orgId,
-          key: msg.key,
-          messageType,
-          body,
-          rawMessage: msg.message,
-        },
-        "GW OUTGOING TRADEIN MESSAGE"
-      );
-    }
+      const remoteJid = (msg.key.remoteJid as string | undefined) || null;
+      const remoteJidAlt = getRemoteJidAlt(msg);
+
+      // ✅ enrichit mapping PN<->LID dès qu'on le voit
+      rememberFromKey(sess!, remoteJid, remoteJidAlt);
+
+      const chatIdCanonical = computeCanonicalChatId(remoteJid, remoteJidAlt);
 
       const simplified = {
         id: msg.key.id,
-        from: msg.key.remoteJid,
+        from: remoteJid,
+        fromAlt: remoteJidAlt,
+        chatIdCanonical,
         fromMe: msg.key.fromMe,
         pushName: (msg as any).pushName,
         timestamp: (msg.messageTimestamp || 0).toString(),
@@ -704,15 +774,11 @@ async function startSession(orgId: string): Promise<Session> {
       });
 
       // 🔔 Webhook Supabase (INBOUND) :
-      // -> on GARDE l'ancien format: payload.body / payload.from / payload.pushName
-      // -> on AJOUTE en plus payload.zapi avec la version "Z-API-like"
       if (!msg.key.fromMe) {
         const zmsg = buildZapiLikeMessage(msg, sess!, orgId);
 
         const webhookPayload = {
-          // ancien format (compatibilité avec ton wa-webhook actuel)
           ...simplified,
-          // nouveau champ: message complet façon Z-API
           zapi: zmsg,
         };
 
@@ -740,7 +806,6 @@ app.get("/wa/sse", async (req: Request, res: Response) => {
   const orgId = String(req.query.orgId || "");
   if (!orgId) return res.status(400).end("orgId required");
 
-  // Garder la connexion ouverte
   req.socket.setTimeout(0);
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
@@ -754,7 +819,6 @@ app.get("/wa/sse", async (req: Request, res: Response) => {
     res.write(`data: ${JSON.stringify(data)}\n\n`);
   };
 
-  // Snapshot initial
   const s = sessions.get(orgId);
   send("hello", {
     orgId,
@@ -764,13 +828,11 @@ app.get("/wa/sse", async (req: Request, res: Response) => {
     user: s?.sock?.user || null,
   });
 
-  // Si un QR est déjà présent, on renvoie le SVG directement
   if (s?.qr) {
     const qrSvg = await QRCode.toString(s.qr, { type: "svg" });
     send("qr", { qr: s.qr, svg: qrSvg });
   }
 
-  // Si on a déjà de l’historique en mémoire, on l’envoie une fois
   if (s && (s.chats.size || s.contacts.size)) {
     send("history", {
       type: "set",
@@ -880,8 +942,7 @@ app.get("/wa/bootstrap", async (req: Request, res: Response) => {
   }
 
   const chats = Array.from(s.chats.values()).sort(
-    (a, b) =>
-      (b.lastMessageTimestamp || 0) - (a.lastMessageTimestamp || 0)
+    (a, b) => (b.lastMessageTimestamp || 0) - (a.lastMessageTimestamp || 0)
   );
 
   const contacts = Array.from(s.contacts.values());
@@ -898,9 +959,7 @@ app.get("/wa/profile-picture", async (req: Request, res: Response) => {
   const orgId = String(req.query.orgId || "");
   const jid = String(req.query.jid || "");
   if (!orgId || !jid) {
-    return res
-      .status(400)
-      .json({ ok: false, error: "orgId,jid required" });
+    return res.status(400).json({ ok: false, error: "orgId,jid required" });
   }
 
   const s = getSessionOr404(orgId, res);
@@ -932,7 +991,6 @@ app.post("/wa/logout", async (req: Request, res: Response) => {
 
   sessions.delete(id);
 
-  // ✅ On supprime aussi l’auth disque pour forcer un nouveau QR au prochain login
   await clearSessionAuth(id);
 
   res.json({ ok: true });
@@ -952,103 +1010,85 @@ app.post("/wa/send/text", async (req: Request, res: Response) => {
   } = req.body || {};
 
   if (!orgId || !to || !text) {
-    return res
-      .status(400)
-      .json({ ok: false, error: "orgId,to,text required" });
+    return res.status(400).json({ ok: false, error: "orgId,to,text required" });
   }
 
-  // 🔎 Log brut de ce que reçoit la gateway
-  logger.info(
-    { body: req.body },
-    "GW /wa/send/text incoming payload"
-  );
+  logger.info({ body: req.body }, "GW /wa/send/text incoming payload");
 
   const s = getSessionOr404(String(orgId), res);
   if (!s) return;
 
   try {
-    const jid = phoneToJid(String(to));
+    // ✅ PN -> LID si dispo
+    const { pn, lid, sendTo } = await resolveSendJid(s, String(to));
+
     const options: any = {};
 
     if (quotedMsgId) {
       options.quoted = {
-        key: { id: quotedMsgId, fromMe: false, remoteJid: jid },
+        key: { id: quotedMsgId, fromMe: false, remoteJid: sendTo },
       };
     }
 
-    // ✅ Active le link preview natif de Baileys si demandé
     const enablePreview = link_preview ?? linkPreview;
-    if (enablePreview) {
-      options.linkPreview = true;
-    }
+    if (enablePreview) options.linkPreview = true;
 
     const content: AnyMessageContent = { text: String(text) };
     if (Array.isArray(mentions) && mentions.length) {
       (content as any).mentions = mentions.map((p: string) => phoneToJid(p));
     }
 
-    // 🔎 Log juste avant l’envoi Baileys
-    logger.info(
-      { jid, content, options },
-      "GW /wa/send/text before sendMessage"
-    );
+    logger.info({ pn, lid, sendTo, content, options }, "GW /wa/send/text before sendMessage");
 
-    const sent = await s.sock!.sendMessage(jid, content, options);
+    const sent = await s.sock!.sendMessage(sendTo, content, options);
 
-    // 🔎 Log après envoi
-    logger.info(
-      { key: sent?.key },
-      "GW /wa/send/text sent"
-    );
+    logger.info({ key: sent?.key }, "GW /wa/send/text sent");
 
-    // Webhook: message sortant (via Zuria)
     void postWebhook("message.outgoing", String(orgId), {
       kind: "text",
-      to: jid,
+      to: sendTo,
+      toPn: pn,
+      toLid: lid,
       key: sent.key,
       body: String(text),
     });
 
-    res.json({ ok: true, key: sent.key });
+    res.json({ ok: true, key: sent.key, to: sendTo, toPn: pn, toLid: lid });
   } catch (err) {
-    logger.error(
-      { err: String(err), orgId, to, text },
-      "GW /wa/send/text error"
-    );
+    logger.error({ err: String(err), orgId, to, text }, "GW /wa/send/text error");
     res.status(500).json({ ok: false, error: String(err) });
   }
 });
 
-
 app.post("/wa/send/image", async (req: Request, res: Response) => {
   const { orgId, to, caption, image } = req.body || {};
   if (!orgId || !to || !image) {
-    return res
-      .status(400)
-      .json({ ok: false, error: "orgId,to,image required" });
+    return res.status(400).json({ ok: false, error: "orgId,to,image required" });
   }
 
   const s = getSessionOr404(String(orgId), res);
   if (!s) return;
 
   try {
-    const jid = phoneToJid(String(to));
+    const { pn, lid, sendTo } = await resolveSendJid(s, String(to));
     const buf = await bufferFromInput(image);
 
     const msg: AnyMessageContent = buf
       ? { image: buf, caption }
       : { image: { url: image.url }, caption };
 
-    const sent = await s.sock!.sendMessage(jid, msg);
+    const sent = await s.sock!.sendMessage(sendTo, msg);
 
     void postWebhook("message.outgoing", String(orgId), {
       kind: "image",
-      to: jid,
+      to: sendTo,
+      toPn: pn,
+      toLid: lid,
       key: sent.key,
       caption: caption || null,
     });
 
-    res.json({ ok: true, key: sent.key });
+    res.json({ ok: true, key: sent.key, to: sendTo, toPn: pn, toLid: lid });
   } catch (err) {
     res.status(500).json({ ok: false, error: String(err) });
   }
@@ -1057,41 +1097,33 @@ app.post("/wa/send/image", async (req: Request, res: Response) => {
 app.post("/wa/send/document", async (req: Request, res: Response) => {
   const { orgId, to, fileName, mimetype, document } = req.body || {};
   if (!orgId || !to || !document) {
-    return res
-      .status(400)
-      .json({ ok: false, error: "orgId,to,document required" });
+    return res.status(400).json({ ok: false, error: "orgId,to,document required" });
   }
 
   const s = getSessionOr404(String(orgId), res);
   if (!s) return;
 
   try {
-    const jid = phoneToJid(String(to));
+    const { pn, lid, sendTo } = await resolveSendJid(s, String(to));
     const buf = await bufferFromInput(document);
 
     const msg: AnyMessageContent = buf
-      ? {
-          document: buf,
-          fileName: fileName || "file",
-          mimetype,
-        }
-      : {
-          document: { url: document.url },
-          fileName: fileName || "file",
-          mimetype,
-        };
+      ? { document: buf, fileName: fileName || "file", mimetype }
+      : { document: { url: document.url }, fileName: fileName || "file", mimetype };
 
-    const sent = await s.sock!.sendMessage(jid, msg);
+    const sent = await s.sock!.sendMessage(sendTo, msg);
 
     void postWebhook("message.outgoing", String(orgId), {
       kind: "document",
-      to: jid,
+      to: sendTo,
+      toPn: pn,
+      toLid: lid,
       key: sent.key,
       fileName: fileName || "file",
       mimetype: mimetype || null,
     });
 
-    res.json({ ok: true, key: sent.key });
+    res.json({ ok: true, key: sent.key, to: sendTo, toPn: pn, toLid: lid });
   } catch (err) {
     res.status(500).json({ ok: false, error: String(err) });
   }
@@ -1100,32 +1132,32 @@ app.post("/wa/send/document", async (req: Request, res: Response) => {
 app.post("/wa/send/audio", async (req: Request, res: Response) => {
   const { orgId, to, ptt, audio } = req.body || {};
   if (!orgId || !to || !audio) {
-    return res
-      .status(400)
-      .json({ ok: false, error: "orgId,to,audio required" });
+    return res.status(400).json({ ok: false, error: "orgId,to,audio required" });
   }
 
   const s = getSessionOr404(String(orgId), res);
   if (!s) return;
 
   try {
-    const jid = phoneToJid(String(to));
+    const { pn, lid, sendTo } = await resolveSendJid(s, String(to));
     const buf = await bufferFromInput(audio);
 
     const msg: AnyMessageContent = buf
       ? { audio: buf, ptt: Boolean(ptt) }
       : { audio: { url: audio.url }, ptt: Boolean(ptt) };
 
-    const sent = await s.sock!.sendMessage(jid, msg);
+    const sent = await s.sock!.sendMessage(sendTo, msg);
 
     void postWebhook("message.outgoing", String(orgId), {
       kind: "audio",
-      to: jid,
+      to: sendTo,
+      toPn: pn,
+      toLid: lid,
       key: sent.key,
       ptt: Boolean(ptt),
     });
 
-    res.json({ ok: true, key: sent.key });
+    res.json({ ok: true, key: sent.key, to: sendTo, toPn: pn, toLid: lid });
   } catch (err) {
     res.status(500).json({ ok: false, error: String(err) });
   }
@@ -1134,61 +1166,54 @@ app.post("/wa/send/audio", async (req: Request, res: Response) => {
 app.post("/wa/send/buttons", async (req: Request, res: Response) => {
   const { orgId, to, text, footer, buttons } = req.body || {};
   if (!orgId || !to || !text || !Array.isArray(buttons)) {
-    return res.status(400).json({
-      ok: false,
-      error: "orgId,to,text,buttons required",
-    });
+    return res.status(400).json({ ok: false, error: "orgId,to,text,buttons required" });
   }
 
   const s = getSessionOr404(String(orgId), res);
   if (!s) return;
 
   try {
-    const jid = phoneToJid(String(to));
+    const { pn, lid, sendTo } = await resolveSendJid(s, String(to));
 
     const msg: AnyMessageContent = {
       text,
       footer,
       buttons: buttons.map((b: any, i: number) => ({
         buttonId: String(b.id ?? `btn_${i + 1}`),
-        buttonText: {
-          displayText: String(b.label ?? b.text ?? `Option ${i + 1}`),
-        },
+        buttonText: { displayText: String(b.label ?? b.text ?? `Option ${i + 1}`) },
         type: 1,
       })),
       headerType: 1,
     } as any;
 
-    const sent = await s.sock!.sendMessage(jid, msg);
+    const sent = await s.sock!.sendMessage(sendTo, msg);
 
     void postWebhook("message.outgoing", String(orgId), {
       kind: "buttons",
-      to: jid,
+      to: sendTo,
+      toPn: pn,
+      toLid: lid,
       key: sent.key,
       text,
     });
 
-    res.json({ ok: true, key: sent.key });
+    res.json({ ok: true, key: sent.key, to: sendTo, toPn: pn, toLid: lid });
   } catch (err) {
     res.status(500).json({ ok: false, error: String(err) });
   }
 });
 
 app.post("/wa/send/list", async (req: Request, res: Response) => {
-  const { orgId, to, title, text, footer, buttonText, sections } =
-    req.body || {};
+  const { orgId, to, title, text, footer, buttonText, sections } = req.body || {};
   if (!orgId || !to || !text || !Array.isArray(sections)) {
-    return res.status(400).json({
-      ok: false,
-      error: "orgId,to,text,sections required",
-    });
+    return res.status(400).json({ ok: false, error: "orgId,to,text,sections required" });
   }
 
   const s = getSessionOr404(String(orgId), res);
   if (!s) return;
 
   try {
-    const jid = phoneToJid(String(to));
+    const { pn, lid, sendTo } = await resolveSendJid(s, String(to));
 
     const msg: AnyMessageContent = {
       text,
@@ -1205,17 +1230,19 @@ app.post("/wa/send/list", async (req: Request, res: Response) => {
       })),
     } as any;
 
-    const sent = await s.sock!.sendMessage(jid, msg);
+    const sent = await s.sock!.sendMessage(sendTo, msg);
 
     void postWebhook("message.outgoing", String(orgId), {
       kind: "list",
-      to: jid,
+      to: sendTo,
+      toPn: pn,
+      toLid: lid,
       key: sent.key,
       title,
       text,
     });
 
-    res.json({ ok: true, key: sent.key });
+    res.json({ ok: true, key: sent.key, to: sendTo, toPn: pn, toLid: lid });
   } catch (err) {
     res.status(500).json({ ok: false, error: String(err) });
   }
@@ -1236,9 +1263,14 @@ app.get("/wa/messages/recent", (req: Request, res: Response) => {
 
   s.msgCache.forEach((msg, id) => {
     const body = extractMessageBody(msg);
+    const remoteJid = (msg.key.remoteJid as string | undefined) || null;
+    const remoteJidAlt = getRemoteJidAlt(msg);
+
     out.push({
       id,
-      from: msg.key.remoteJid,
+      from: remoteJid,
+      fromAlt: remoteJidAlt,
+      chatIdCanonical: computeCanonicalChatId(remoteJid, remoteJidAlt),
       fromMe: msg.key.fromMe,
       timestamp: (msg.messageTimestamp || 0).toString(),
       type: msg.message ? Object.keys(msg.message)[0] : undefined,
@@ -1254,9 +1286,7 @@ app.get("/wa/messages/recent", (req: Request, res: Response) => {
 app.post("/wa/media/download", async (req: Request, res: Response) => {
   const { orgId, msgId } = req.body || {};
   if (!orgId || !msgId) {
-    return res
-      .status(400)
-      .json({ ok: false, error: "orgId,msgId required" });
+    return res.status(400).json({ ok: false, error: "orgId,msgId required" });
   }
 
   const s = getSessionOr404(String(orgId), res);
@@ -1264,9 +1294,7 @@ app.post("/wa/media/download", async (req: Request, res: Response) => {
 
   const msg = s.msgCache.get(String(msgId));
   if (!msg) {
-    return res
-      .status(404)
-      .json({ ok: false, error: "Message not in cache" });
+    return res.status(404).json({ ok: false, error: "Message not in cache" });
   }
 
   try {
@@ -1301,9 +1329,7 @@ app.post("/wa/media/download", async (req: Request, res: Response) => {
 app.get("/wa/media/:orgId/:msgId", async (req: Request, res: Response) => {
   const { orgId, msgId } = req.params;
   if (!orgId || !msgId) {
-    return res
-      .status(400)
-      .json({ ok: false, error: "orgId,msgId required" });
+    return res.status(400).json({ ok: false, error: "orgId,msgId required" });
   }
 
   const s = getSessionOr404(String(orgId), res);
@@ -1311,9 +1337,7 @@ app.get("/wa/media/:orgId/:msgId", async (req: Request, res: Response) => {
 
   const msg = s.msgCache.get(String(msgId));
   if (!msg) {
-    return res
-      .status(404)
-      .json({ ok: false, error: "Message not in cache" });
+    return res.status(404).json({ ok: false, error: "Message not in cache" });
   }
 
   try {
