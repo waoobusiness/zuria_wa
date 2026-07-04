@@ -1454,13 +1454,16 @@ app.get("/wa/media/:orgId/:msgId", async (req: Request, res: Response) => {
   }
 });
 
-// ----------- Vérification de numéros WhatsApp (à ajouter dans src/server.ts de zuria_wa)
-// Coller ce bloc avant la section "----------- Health".
-// Utilise sock.onWhatsApp() de Baileys — accepte des lots, protégé par checkAuth (WA_API_KEY).
+// ----------- Vérification de numéros WhatsApp — VERSION CORRIGÉE (v2)
+// Remplace ENTIÈREMENT le bloc /wa/check-numbers précédent dans src/server.ts de zuria_wa.
 //
-// POST /wa/check-numbers
-// Body: { orgId: string, numbers: string[] }   // max 50 numéros par appel, format +417..., +336..., etc.
-// Réponse: { ok: true, results: [{ input, exists, jid | null }] }
+// Corrections v2 :
+//  - onWhatsApp() reçoit des numéros BRUTS (digits), pas des JID — c'était la cause
+//    des "Pas sur WhatsApp" systématiques.
+//  - Mapping des résultats par digits (gère les retours jid PN ou LID de Baileys v7).
+//  - Réponse: { ok, results: [{ number, input, exists, jid }] }
+//
+// POST /wa/check-numbers   Body: { orgId: string, numbers: string[] }  (max 50)
 
 app.post("/wa/check-numbers", async (req: Request, res: Response) => {
   if (!checkAuth(req, res)) return;
@@ -1482,6 +1485,9 @@ app.post("/wa/check-numbers", async (req: Request, res: Response) => {
   const s = getSessionOr404(String(orgId), res);
   if (!s) return;
 
+  const toDigits = (n: string) =>
+    String(n).replace(/[^\d]/g, "").replace(/^00/, "");
+
   try {
     const results: {
       number: string;
@@ -1490,30 +1496,35 @@ app.post("/wa/check-numbers", async (req: Request, res: Response) => {
       jid: string | null;
     }[] = [];
 
-    // Baileys onWhatsApp accepte plusieurs numéros, mais on itère par
-    // petits groupes de 10 avec une pause pour rester discret.
     const CHUNK = 10;
     for (let i = 0; i < numbers.length; i += CHUNK) {
       const chunk = numbers.slice(i, i + CHUNK).map(String);
-      const jids = chunk.map((n) => phoneToJid(n));
+      // ✅ Baileys onWhatsApp attend des numéros bruts, PAS des JID
+      const digits = chunk.map(toDigits);
 
-      const found = await s.sock!.onWhatsApp(...jids);
-      const foundMap = new Map(
-        (found || []).map((f: any) => [String(f.jid), Boolean(f.exists)])
-      );
+      const found = await s.sock!.onWhatsApp(...digits);
+
+      // Map par digits — le jid retourné peut être PN (417...@s.whatsapp.net)
+      // ou, selon les builds v7, un LID ; on extrait les digits du jid PN
+      // et on garde aussi l'ordre de la requête comme filet.
+      const existsByDigits = new Map<string, { exists: boolean; jid: string | null }>();
+      for (const f of (found || []) as any[]) {
+        const jid: string = String(f.jid || "");
+        const d = toDigits(jid.split("@")[0].split(":")[0]);
+        if (d) existsByDigits.set(d, { exists: Boolean(f.exists), jid });
+      }
 
       for (let j = 0; j < chunk.length; j++) {
-        const jid = jids[j];
-        const exists = foundMap.get(jid) ?? false;
+        const d = digits[j];
+        const hit = existsByDigits.get(d);
         results.push({
-          number: chunk[j], // format attendu par l'edge function commerce-verify-whatsapp
+          number: chunk[j],
           input: chunk[j],
-          exists,
-          jid: exists ? jid : null,
+          exists: hit ? hit.exists : false,
+          jid: hit?.exists ? hit.jid : null,
         });
       }
 
-      // pause 1.5–3 s entre les groupes
       if (i + CHUNK < numbers.length) {
         await new Promise((r) =>
           setTimeout(r, 1500 + Math.floor(Math.random() * 1500))
@@ -1522,7 +1533,11 @@ app.post("/wa/check-numbers", async (req: Request, res: Response) => {
     }
 
     logger.info(
-      { orgId, total: numbers.length, found: results.filter((r) => r.exists).length },
+      {
+        orgId,
+        total: numbers.length,
+        found: results.filter((r) => r.exists).length,
+      },
       "GW /wa/check-numbers done"
     );
 
