@@ -1454,16 +1454,17 @@ app.get("/wa/media/:orgId/:msgId", async (req: Request, res: Response) => {
   }
 });
 
-// ----------- Vérification de numéros WhatsApp — VERSION CORRIGÉE (v2)
-// Remplace ENTIÈREMENT le bloc /wa/check-numbers précédent dans src/server.ts de zuria_wa.
+// ----------- Vérification de numéros WhatsApp — v3 (fix PN/LID)
+// REMPLACE ENTIÈREMENT le bloc app.post("/wa/check-numbers", ...) actuel.
 //
-// Corrections v2 :
-//  - onWhatsApp() reçoit des numéros BRUTS (digits), pas des JID — c'était la cause
-//    des "Pas sur WhatsApp" systématiques.
-//  - Mapping des résultats par digits (gère les retours jid PN ou LID de Baileys v7).
-//  - Réponse: { ok, results: [{ number, input, exists, jid }] }
+// Fix v3 : Baileys v7 peut renvoyer des jid au format LID (…@lid) dont les
+// chiffres ne correspondent pas au numéro demandé → le mapping par digits
+// échouait et tout ressortait "pas sur WhatsApp".
+// Solution : interroger UN numéro à la fois — la réponse correspond alors
+// forcément au numéro demandé, quel que soit le format du jid retourné.
 //
 // POST /wa/check-numbers   Body: { orgId: string, numbers: string[] }  (max 50)
+// Réponse: { ok: true, results: [{ number, input, exists, jid }] }
 
 app.post("/wa/check-numbers", async (req: Request, res: Response) => {
   if (!checkAuth(req, res)) return;
@@ -1496,38 +1497,34 @@ app.post("/wa/check-numbers", async (req: Request, res: Response) => {
       jid: string | null;
     }[] = [];
 
-    const CHUNK = 10;
-    for (let i = 0; i < numbers.length; i += CHUNK) {
-      const chunk = numbers.slice(i, i + CHUNK).map(String);
-      // ✅ Baileys onWhatsApp attend des numéros bruts, PAS des JID
-      const digits = chunk.map(toDigits);
+    for (let i = 0; i < numbers.length; i++) {
+      const input = String(numbers[i]);
+      const digits = toDigits(input);
 
-      const found = await s.sock!.onWhatsApp(...digits);
+      let exists = false;
+      let jid: string | null = null;
 
-      // Map par digits — le jid retourné peut être PN (417...@s.whatsapp.net)
-      // ou, selon les builds v7, un LID ; on extrait les digits du jid PN
-      // et on garde aussi l'ordre de la requête comme filet.
-      const existsByDigits = new Map<string, { exists: boolean; jid: string | null }>();
-      for (const f of (found || []) as any[]) {
-        const jid: string = String(f.jid || "");
-        const d = toDigits(jid.split("@")[0].split(":")[0]);
-        if (d) existsByDigits.set(d, { exists: Boolean(f.exists), jid });
+      if (digits.length >= 6) {
+        try {
+          // ✅ UN numéro par appel : la réponse (0 ou 1 entrée) est
+          // nécessairement celle de CE numéro, LID ou pas.
+          const found = await s.sock!.onWhatsApp(digits);
+          const hit: any = Array.isArray(found) ? found[0] : null;
+          if (hit) {
+            exists = hit.exists !== false; // certains builds omettent exists quand trouvé
+            jid = hit.jid ? String(hit.jid) : null;
+          }
+        } catch (err) {
+          logger.warn({ err, input, orgId }, "check-numbers: onWhatsApp failed for one number");
+        }
       }
 
-      for (let j = 0; j < chunk.length; j++) {
-        const d = digits[j];
-        const hit = existsByDigits.get(d);
-        results.push({
-          number: chunk[j],
-          input: chunk[j],
-          exists: hit ? hit.exists : false,
-          jid: hit?.exists ? hit.jid : null,
-        });
-      }
+      results.push({ number: input, input, exists, jid: exists ? jid : null });
 
-      if (i + CHUNK < numbers.length) {
+      // pause courte entre chaque numéro (discrétion)
+      if (i < numbers.length - 1) {
         await new Promise((r) =>
-          setTimeout(r, 1500 + Math.floor(Math.random() * 1500))
+          setTimeout(r, 300 + Math.floor(Math.random() * 400))
         );
       }
     }
@@ -1537,8 +1534,9 @@ app.post("/wa/check-numbers", async (req: Request, res: Response) => {
         orgId,
         total: numbers.length,
         found: results.filter((r) => r.exists).length,
+        sample: results.slice(0, 3),
       },
-      "GW /wa/check-numbers done"
+      "GW /wa/check-numbers done (v3)"
     );
 
     return res.json({ ok: true, results });
