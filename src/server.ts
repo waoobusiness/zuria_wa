@@ -1454,6 +1454,85 @@ app.get("/wa/media/:orgId/:msgId", async (req: Request, res: Response) => {
   }
 });
 
+// ----------- Vérification de numéros WhatsApp (à ajouter dans src/server.ts de zuria_wa)
+// Coller ce bloc avant la section "----------- Health".
+// Utilise sock.onWhatsApp() de Baileys — accepte des lots, protégé par checkAuth (WA_API_KEY).
+//
+// POST /wa/check-numbers
+// Body: { orgId: string, numbers: string[] }   // max 50 numéros par appel, format +417..., +336..., etc.
+// Réponse: { ok: true, results: [{ input, exists, jid | null }] }
+
+app.post("/wa/check-numbers", async (req: Request, res: Response) => {
+  if (!checkAuth(req, res)) return;
+
+  const { orgId, numbers } = req.body || {};
+
+  if (!orgId || !Array.isArray(numbers) || numbers.length === 0) {
+    return res
+      .status(400)
+      .json({ ok: false, error: "orgId, numbers[] required" });
+  }
+
+  if (numbers.length > 50) {
+    return res
+      .status(400)
+      .json({ ok: false, error: "max 50 numbers per call" });
+  }
+
+  const s = getSessionOr404(String(orgId), res);
+  if (!s) return;
+
+  try {
+    const results: {
+      number: string;
+      input: string;
+      exists: boolean;
+      jid: string | null;
+    }[] = [];
+
+    // Baileys onWhatsApp accepte plusieurs numéros, mais on itère par
+    // petits groupes de 10 avec une pause pour rester discret.
+    const CHUNK = 10;
+    for (let i = 0; i < numbers.length; i += CHUNK) {
+      const chunk = numbers.slice(i, i + CHUNK).map(String);
+      const jids = chunk.map((n) => phoneToJid(n));
+
+      const found = await s.sock!.onWhatsApp(...jids);
+      const foundMap = new Map(
+        (found || []).map((f: any) => [String(f.jid), Boolean(f.exists)])
+      );
+
+      for (let j = 0; j < chunk.length; j++) {
+        const jid = jids[j];
+        const exists = foundMap.get(jid) ?? false;
+        results.push({
+          number: chunk[j], // format attendu par l'edge function commerce-verify-whatsapp
+          input: chunk[j],
+          exists,
+          jid: exists ? jid : null,
+        });
+      }
+
+      // pause 1.5–3 s entre les groupes
+      if (i + CHUNK < numbers.length) {
+        await new Promise((r) =>
+          setTimeout(r, 1500 + Math.floor(Math.random() * 1500))
+        );
+      }
+    }
+
+    logger.info(
+      { orgId, total: numbers.length, found: results.filter((r) => r.exists).length },
+      "GW /wa/check-numbers done"
+    );
+
+    return res.json({ ok: true, results });
+  } catch (err) {
+    logger.error({ err, orgId }, "GW /wa/check-numbers error");
+    return res.status(500).json({ ok: false, error: String(err) });
+  }
+});
+
 // ----------- Health
 
 app.get("/health", (_req, res) =>
