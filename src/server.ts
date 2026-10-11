@@ -1185,6 +1185,40 @@ app.post("/wa/send/image", async (req: Request, res: Response) => {
   }
 });
 
+app.post("/wa/send/video", async (req: Request, res: Response) => {
+  const { orgId, to, caption, video } = req.body || {};
+  if (!orgId || !to || !video) {
+    return res.status(400).json({ ok: false, error: "orgId,to,video required" });
+  }
+
+  const s = getSessionOr404(String(orgId), res);
+  if (!s) return;
+
+  try {
+    const { pn, lid, sendTo } = await resolveSendJid(s, String(to));
+    const buf = await bufferFromInput(video);
+
+    const msg: AnyMessageContent = buf
+      ? { video: buf, caption, mimetype: "video/mp4" }
+      : { video: { url: video.url }, caption, mimetype: "video/mp4" };
+
+    const sent = await s.sock!.sendMessage(sendTo, msg);
+
+    void postWebhook("message.outgoing", String(orgId), {
+      kind: "video",
+      to: sendTo,
+      toPn: pn,
+      toLid: lid,
+      key: sent.key,
+      caption: caption || null,
+    });
+
+    res.json({ ok: true, key: sent.key, to: sendTo, toPn: pn, toLid: lid });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: String(err) });
+  }
+});
+
 app.post("/wa/send/document", async (req: Request, res: Response) => {
   const { orgId, to, fileName, mimetype, document } = req.body || {};
   if (!orgId || !to || !document) {
